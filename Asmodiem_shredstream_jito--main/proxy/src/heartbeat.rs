@@ -102,7 +102,7 @@ pub fn heartbeat_loop_thread(
                 )
             );
             // Shredstream client lives here -- so it has the same scope as per_con_exit
-            let (mut shredstream_client , refresh_thread_hdl) = match shredstream_client_res {
+            let (mut shredstream_client, refresh_thread_hdl) = match shredstream_client_res {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Failed to connect to block engine, retrying. Error: {e}");
@@ -121,19 +121,23 @@ pub fn heartbeat_loop_thread(
                 crossbeam_channel::select! {
                     // send heartbeat
                     recv(heartbeat_tick) -> _ => {
-                        // Wrap the gRPC call in a timeout so that a non-responsive block engine
-                        // cannot stall this thread indefinitely. Without the timeout, block_on()
-                        // would hold the OS thread for the full gRPC call duration, preventing
-                        // the shutdown_receiver and metrics_tick arms from being processed.
-                        let heartbeat_future = tokio::time::timeout(
-                            HEARTBEAT_SEND_TIMEOUT,
-                            shredstream_client.send_heartbeat(Heartbeat {
-                                socket: Some(heartbeat_socket.clone()),
-                                regions: desired_regions.clone(),
-                            }),
-                        );
-
-                        match runtime.block_on(heartbeat_future) {
+                        // tokio::time::timeout internally registers a timer with the Tokio
+                        // time driver, which is part of the reactor — the event loop that
+                        // drives all async I/O and timer wakeups. The reactor only exists
+                        // inside a live Tokio runtime context. Constructing a timeout future
+                        // outside of runtime.block_on() means there is no reactor available
+                        // at construction time, causing a panic. By constructing the timeout
+                        // future inside the async block passed to block_on(), we guarantee
+                        // the reactor is already running when the timer is registered.
+                        match runtime.block_on(async {
+                            tokio::time::timeout(
+                                HEARTBEAT_SEND_TIMEOUT,
+                                shredstream_client.send_heartbeat(Heartbeat {
+                                    socket: Some(heartbeat_socket.clone()),
+                                    regions: desired_regions.clone(),
+                                }),
+                            ).await
+                        }) {
                             // Timed out waiting for the block engine to respond.
                             Err(_elapsed) => {
                                 warn!(
@@ -202,7 +206,6 @@ pub fn heartbeat_loop_thread(
                             break;
                         }
                         last_cumulative_received_shred_count = new_received_count;
-
 
                         successful_heartbeat_count_cumulative += successful_heartbeat_count;
                         failed_heartbeat_count_cumulative += failed_heartbeat_count;
