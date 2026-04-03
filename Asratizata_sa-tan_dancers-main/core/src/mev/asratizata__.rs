@@ -250,7 +250,7 @@ pub fn initialize_mev_components(
             config.lut_addresses.len()
         );
         Arc::new(
-            LutManager::new_with_luts(config.lut_addresses.clone(), &rpc_client)
+            LutManager::new_with_luts(config.lut_addresses.clone(), &Arc::new(RpcClient::new("https://mainnet.helius-rpc.com/?api-key=db75ab85-690e-483d-b351-dc1bd0a2e9b3".to_string())))
                 .context("MEV startup: failed to load address lookup tables")?,
         )
     } else {
