@@ -17,7 +17,7 @@ use crate::mev::dex::vertigo::{vertigo_program_id, VertigoInfo};
 use crate::mev::dex::whirlpool::{constants::whirlpool_program_id, state::Whirlpool};
 use solana_account::ReadableAccount;
 use solana_runtime::bank::Bank;
-use solana_accounts_db::accounts_index::ScanConfig;
+use solana_accounts_db::accounts_index::{IndexKey, ScanConfig};
 use solana_pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -143,21 +143,55 @@ fn is_quote_token(t: &Pubkey) -> bool {
 /// ran as a standalone process with no access to the validator's internal indices.
 ///
 /// Inside the Agave validator process, `AccountsDb` maintains a program-ownership
-/// index that maps each program ID to the set of accounts it owns. `Bank::get_program_accounts`
-/// queries this index directly, returning only the accounts owned by a specific program.
-/// This means instead of walking 300 million accounts once, we make 14 targeted queries
-/// and visit only the pool state accounts — roughly 500K total across all DEXes. Every
-/// returned account's owner is already known from the query that produced it, so no
-/// per-account owner check is required inside the parse loop.
+/// secondary index that maps each program ID to the set of accounts it owns. This
+/// index is built at startup when the validator is launched with `--account-index
+/// program-id`. The call path that reaches this index is:
+///
+///   `bank.get_filtered_indexed_accounts(IndexKey::ProgramId(id))`
+///     -> `accounts.load_by_index_key_with_filter()`         [accounts.rs]
+///       -> `accounts_db.index_scan_accounts()`              [accounts_db.rs]
+///         -> if account_indexes.include_key(id)             [accounts_db.rs:3423]
+///              -> `accounts_index.index_scan_accounts()`    ← O(n_owned) fast path
+///           else
+///              -> `accounts_db.scan_accounts()`             ← full linear scan fallback
+///
+/// `bank.get_program_accounts()` ALWAYS takes the slow path because it calls
+/// `accounts_db.scan_accounts()` directly, bypassing `index_scan_accounts` entirely.
+/// Traced from bank.rs:4832 -> accounts.rs:322 -> accounts_db.rs:3375.
+///
+/// Both conditions are required for the fast path to activate:
+///   1. The validator must be started with `--account-index program-id` so
+///      `AccountsDb.account_indexes` contains `AccountIndex::ProgramId` and
+///      `account_indexes.include_key()` returns true for DEX program IDs.
+///   2. This function must call `get_filtered_indexed_accounts` rather than
+///      `get_program_accounts` to route through `index_scan_accounts`.
+///
+/// With both conditions met, each of the 14 queries visits only the accounts
+/// owned by that specific program rather than walking all 300M+ accounts on
+/// mainnet. RaydiumV4 which has ~1.4M owned accounts drops from 48 minutes
+/// to seconds.
 pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscoveryResult> {
     info!(
         "Starting pool discovery from bank at slot {} — querying 14 DEX programs",
         bank.slot()
     );
 
+    // Warn at startup if the program-id secondary index is not active.
+    // Without it every query below falls back to a full linear scan of all
+    // accounts in the database. The validator must be started with
+    // --account-index program-id for the fast path to be taken.
+    let raydium_v4_program     = raydium_program_id();
+    if !bank.account_indexes_include_key(&raydium_v4_program) {
+        warn!(
+            "pool_scanner: program-id secondary index is NOT active. \
+             All 14 DEX queries will fall back to full account scans. \
+             Start the validator with --account-index program-id to enable \
+             the fast path. Startup may take tens of minutes without it."
+        );
+    }
+
     let scan_cfg = ScanConfig::default();
 
-    let raydium_v4_program     = raydium_program_id();
     let raydium_clmm_program   = raydium_clmm_program_id();
     let raydium_cpmm_program   = raydium_cp_program_id();
     let meteora_damm_program   = damm_program_id();
@@ -184,7 +218,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // equals zero since it is the first section, but the pattern is kept uniform
     // so all 14 log lines are directly comparable.
     let before = found;
-    match bank.get_program_accounts(&raydium_v4_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(raydium_v4_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -207,7 +246,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Raydium CLMM
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&raydium_clmm_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(raydium_clmm_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -230,7 +274,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Raydium CPMM
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&raydium_cpmm_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(raydium_cpmm_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -253,7 +302,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Meteora DAMM
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&meteora_damm_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(meteora_damm_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -284,7 +338,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Meteora DAMM V2
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&meteora_dammv2_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(meteora_dammv2_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -307,7 +366,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Meteora DLMM
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&meteora_dlmm_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(meteora_dlmm_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -330,7 +394,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Orca Whirlpool
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&whirlpool_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(whirlpool_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -361,7 +430,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // PumpSwap
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&pump_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(pump_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -384,7 +458,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Byreal — shares Raydium CLMM's PoolState layout under a different program ID
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&byreal_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(byreal_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -407,7 +486,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // PancakeSwap — shares Raydium CLMM's PoolState layout under a different program ID
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&pancakeswap_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(pancakeswap_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -430,7 +514,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Humidifi
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&humidifi_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(humidifi_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -453,7 +542,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Vertigo
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&vertigo_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(vertigo_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -476,7 +570,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Heaven
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&heaven_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(heaven_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
@@ -499,7 +598,12 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     // Futarchy
     // -------------------------------------------------------------------------
     let before = found;
-    match bank.get_program_accounts(&futarchy_program, &scan_cfg) {
+    match bank.get_filtered_indexed_accounts(
+        &IndexKey::ProgramId(futarchy_program),
+        |_| true,
+        &scan_cfg,
+        None,
+    ) {
         Ok(accounts) => {
             let count = accounts.len();
             for (pubkey, account) in accounts {
