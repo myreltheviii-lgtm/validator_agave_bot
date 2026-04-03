@@ -6606,6 +6606,7 @@ dependencies = [
  "rayon",
  "rolling-file",
  "rts-alloc",
+ "rustc-hash 2.1.1",
  "rustls",
  "serde",
  "serde_bytes",
@@ -6708,6 +6709,7 @@ dependencies = [
  "tokio-util 0.7.18",
  "tonic",
  "tonic-build",
+ "tracing",
  "trees",
  "wincode",
 ]

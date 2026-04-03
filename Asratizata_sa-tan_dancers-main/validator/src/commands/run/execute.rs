@@ -861,6 +861,15 @@ pub fn execute(
     // live trading mode.
     let mev_validation_mode = matches.is_present("mev_validation_mode");
 
+    // When --mev-speculative-accuracy-check is present, MevEngine::confirm_slot
+    // reads every account it speculatively tracked from the newly frozen canonical
+    // bank and logs a warning for each value that differs from the speculative
+    // shadow copy.  This is purely diagnostic: it helps identify which pool
+    // deserialisers or swap-math routines compute incorrect state relative to what
+    // canonical replay actually commits.  The cost is O(watched_accounts) bank reads
+    // per frozen slot and should never be left on in production.
+    let mev_speculative_accuracy_check = matches.is_present("mev_speculative_accuracy_check");
+
     // Collect all --mev-lut-address values. Each value has already been validated
     // as a valid Pubkey by the clap validator defined in args.rs, so parse() here
     // will not fail. The resulting Vec is empty when no --mev-lut-address flags
@@ -1027,6 +1036,10 @@ pub fn execute(
         mev_rpc_url,
         mev_base_priority_fee,
         mev_validation_mode,
+        // Compares each speculative account value against the canonical frozen bank
+        // after every confirm_slot call.  Off by default; enable only for accuracy
+        // diagnostics because it adds bank reads proportional to watched-account count.
+        mev_speculative_accuracy_check,
         mev_lut_addresses,
         mev_min_profit_lamports,
         mev_shredstream_url,

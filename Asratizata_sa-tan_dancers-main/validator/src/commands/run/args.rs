@@ -1438,6 +1438,30 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        // Speculative execution works by replaying each incoming shredstream entry
+        // batch against a shadow copy of bank state that has not yet been frozen by
+        // the canonical replay pipeline.  When this flag is set, MevEngine calls
+        // confirm_slot on each newly frozen canonical bank and compares every
+        // speculative account value it tracked against the canonical frozen value.
+        // Any mismatch is emitted as a warning log so you can identify which pool
+        // deserialisers or swap-math routines produce diverging state.
+        //
+        // Cost: one Bank::get_account() call per tracked account per frozen slot
+        // (roughly 2.5 freezes/second on mainnet), so leave this off in production
+        // and only enable it when diagnosing speculative accuracy issues.
+        Arg::with_name("mev_speculative_accuracy_check")
+            .long("mev-speculative-accuracy-check")
+            .takes_value(false)
+            .requires("mev_enabled")
+            .help(
+                "After each slot is frozen by canonical replay, compare every account \
+                 value that the MEV speculative executor computed against the corresponding \
+                 value in the frozen canonical bank and warn on any mismatch. This is a \
+                 diagnostic flag for validating speculative-execution accuracy and adds \
+                 O(watched_accounts) bank reads per frozen slot. Disable in production.",
+            ),
+    )
+    .arg(
         Arg::with_name("mev_lut_address")
             .long("mev-lut-address")
             .value_name("PUBKEY")
