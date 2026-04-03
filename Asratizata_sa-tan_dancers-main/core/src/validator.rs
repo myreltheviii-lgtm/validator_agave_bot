@@ -1175,11 +1175,7 @@ impl Validator {
 
         let (replay_vote_sender, replay_vote_receiver) = unbounded();
 
-        let prioritization_fee_cache = if config.rpc_config.full_api {
-            Some(Arc::new(PrioritizationFeeCache::default()))
-        } else {
-            None
-        };
+        let prioritization_fee_cache = Some(Arc::new(PrioritizationFeeCache::default()));
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
 
