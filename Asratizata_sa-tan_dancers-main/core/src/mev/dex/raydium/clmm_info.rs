@@ -8,6 +8,26 @@ pub const REWARD_NUM: usize = 3;
 
 pub const POOL_TICK_ARRAY_BITMAP_SEED: &str = "pool_tick_array_bitmap_extension";
 
+// The exact serialized byte length of a Raydium CLMM PoolState account on-chain,
+// including the 8-byte Anchor discriminator prefix. Every account owned by the
+// Raydium CLMM program that is a genuine PoolState will be exactly this size.
+// Other account types owned by the same program — tick arrays, bitmap extensions,
+// position accounts, fee accounts — are different sizes and will be rejected by
+// the size check in load_checked before any field parsing occurs.
+pub const RAYDIUM_CLMM_POOL_SIZE: usize = 1544;
+
+// The Anchor account discriminator for a Raydium CLMM PoolState account.
+// Anchor computes the discriminator as the first 8 bytes of SHA-256("account:Pool").
+// Every Raydium CLMM PoolState account on-chain begins with these exact 8 bytes.
+// Other account types owned by the Raydium CLMM program — tick arrays, position
+// accounts, bitmap extensions — carry different discriminators and are rejected
+// immediately by the discriminator check before any field parsing occurs.
+// The program ID filter in get_filtered_indexed_accounts already narrows the
+// account set to Raydium CLMM-owned accounts only; the discriminator then narrows
+// further to PoolState accounts specifically. Both filters together provide the
+// strongest possible guarantee that what is being parsed is a genuine pool.
+const POOL_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
+
 pub enum RewardState {
     Uninitialized,
     Initialized,
@@ -103,15 +123,50 @@ pub struct PoolState {
 
 impl PoolState {
     pub fn load_checked(data: &[u8]) -> Result<Self> {
-        if data.len() < 8 + 32 + 32 + 32 + 32 + 32 + 32 + 4 + 2 {
+        // The discriminator occupies the first 8 bytes of every Anchor-managed account.
+        // Reading it requires at least 8 bytes to be present. This check must come
+        // before both the discriminator comparison and the exact size check because
+        // all three operations index into `data` — without this guard a zero-byte or
+        // very short account would panic on any subsequent slice operation.
+        if data.len() < 8 {
             return Err(anyhow::anyhow!(
-                "Invalid data length for RaydiumClmmPoolState"
+                "Account data length {} is too short to contain an Anchor discriminator",
+                data.len()
             ));
         }
 
-        let data = &data[8..]; // Skip the discriminator
+        // The discriminator is the type-level identity of an Anchor account. It is
+        // computed once at program compile time as SHA-256("account:Pool")[0..8] and
+        // is permanently stamped into every account the program initializes under that
+        // type. The Raydium CLMM program owns many account types — PoolState, tick
+        // arrays, bitmap extensions, position accounts — all returned by
+        // get_filtered_indexed_accounts. Checking the discriminator here rejects every
+        // non-PoolState account before a single field offset is touched.
+        if data[0..8] != POOL_DISCRIMINATOR {
+            return Err(anyhow::anyhow!(
+                "Account discriminator does not match Raydium CLMM PoolState discriminator"
+            ));
+        }
+
+        // An exact size match is a second layer of defense on top of the discriminator
+        // check. If a future program upgrade changes the PoolState layout and introduces
+        // accounts of a different size, the size check catches them here rather than
+        // silently parsing fields at wrong offsets and producing garbage pubkeys.
+        if data.len() != RAYDIUM_CLMM_POOL_SIZE {
+            return Err(anyhow::anyhow!(
+                "Account data length {} does not match Raydium CLMM PoolState size {}",
+                data.len(),
+                RAYDIUM_CLMM_POOL_SIZE,
+            ));
+        }
+
+        // All Anchor programs prefix every managed account with an 8-byte discriminator
+        // computed as the first 8 bytes of SHA-256("account:<TypeName>"). Skipping it
+        // here positions the cursor at the first real field of the PoolState layout.
+        let data = &data[8..];
         let mut offset = 0;
 
+        // bump: [u8; 1] — PDA bump seed, not needed for arb routing
         offset += 1;
 
         let mut amm_config = [0u8; 32];
@@ -119,6 +174,7 @@ impl PoolState {
         let amm_config = Pubkey::new_from_array(amm_config);
         offset += 32;
 
+        // owner: Pubkey — pool owner, not needed for arb routing
         offset += 32;
 
         let mut token_mint_0 = [0u8; 32];
@@ -146,6 +202,7 @@ impl PoolState {
         let observation_key = Pubkey::new_from_array(observation_key);
         offset += 32;
 
+        // mint_decimals_0 (u8) + mint_decimals_1 (u8) — not needed for arb routing
         offset += 2;
 
         let mut tick_spacing_bytes = [0u8; 2];
@@ -153,9 +210,10 @@ impl PoolState {
         let tick_spacing = u16::from_le_bytes(tick_spacing_bytes);
         offset += 2;
 
+        // liquidity: u128 — current in-range liquidity, not needed at scan time
         offset += 16;
 
-        // Skip sqrt_price_x64
+        // sqrt_price_x64: u128 — current price as Q64.64 fixed point, not needed at scan time
         offset += 16;
 
         let mut tick_current_bytes = [0u8; 4];

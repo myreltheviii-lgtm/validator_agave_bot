@@ -3,6 +3,24 @@ use anyhow::Result;
 use solana_pubkey::Pubkey;
 use std::mem::size_of;
 
+// The exact serialized byte length of a Meteora DLMM LbPair account on-chain,
+// including the 8-byte Anchor discriminator prefix. Meteora DLMM owns many account
+// types — bin arrays, position accounts, oracle accounts, preset parameter accounts —
+// all returned by get_filtered_indexed_accounts. An exact size match ensures that
+// only genuine LbPair pool accounts reach the unsafe `ptr::read_unaligned` cast
+// below. Passing a non-LbPair account of a different size through that cast would
+// produce garbage field values silently — no panic, but completely wrong pool data.
+pub const METEORA_DLMM_POOL_SIZE: usize = 904;
+
+// The Anchor account discriminator for a Meteora DLMM LbPair account.
+// Anchor computes the discriminator as the first 8 bytes of SHA-256("account:LbPair")
+// or whatever type name Meteora DLMM uses for its pool account. The program ID filter
+// in get_filtered_indexed_accounts already isolates accounts to the DLMM program;
+// the discriminator check then narrows to LbPair accounts specifically. Together
+// these two filters guarantee that only genuine DLMM pool accounts reach the
+// unsafe memory reinterpretation cast in the parser body.
+const POOL_DISCRIMINATOR: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProtocolFee {
@@ -98,6 +116,45 @@ pub struct DlmmInfo {
 
 impl DlmmInfo {
     pub fn load_checked(data: &[u8]) -> Result<Self> {
+        // The discriminator occupies the first 8 bytes of every Anchor-managed account.
+        // Reading it requires at least 8 bytes to be present. This check must come
+        // before the discriminator comparison because that comparison indexes `data[0..8]`
+        // directly — without this guard a zero-byte or sub-8-byte account would panic.
+        if data.len() < 8 {
+            return Err(anyhow::anyhow!(
+                "Account data length {} is too short to contain an Anchor discriminator",
+                data.len()
+            ));
+        }
+
+        // The discriminator is the type-level identity of an Anchor account. It is
+        // computed once at program compile time as SHA-256("account:LbPair")[0..8] and
+        // is permanently stamped into every account the program initializes under that
+        // type. Meteora DLMM owns bin array accounts, position accounts, oracle accounts,
+        // and preset parameter accounts in addition to LbPair pool accounts — all
+        // returned by get_filtered_indexed_accounts. The discriminator check rejects
+        // every non-LbPair account before the unsafe memory reinterpretation cast below.
+        if data[0..8] != POOL_DISCRIMINATOR {
+            return Err(anyhow::anyhow!(
+                "Account discriminator does not match Meteora DLMM LbPair discriminator"
+            ));
+        }
+
+        // An exact size match is a second layer of defense on top of the discriminator
+        // check. The LbPair is parsed via an unsafe `ptr::read_unaligned` cast of the
+        // raw byte slice directly into the LbPair struct. This cast produces well-defined
+        // results only when the slice length exactly matches `size_of::<LbPair>()` and
+        // the bytes represent a valid serialized LbPair. The exact size check here
+        // ensures both that the cast is safe and that no non-LbPair account whose
+        // discriminator somehow collides reaches the unsafe block.
+        if data.len() != METEORA_DLMM_POOL_SIZE {
+            return Err(anyhow::anyhow!(
+                "Account data length {} does not match Meteora DLMM LbPair size {}",
+                data.len(),
+                METEORA_DLMM_POOL_SIZE,
+            ));
+        }
+
         if data.len() < 8 + size_of::<LbPair>() {
             return Err(anyhow::anyhow!("Invalid data length for DlmmInfo"));
         }
