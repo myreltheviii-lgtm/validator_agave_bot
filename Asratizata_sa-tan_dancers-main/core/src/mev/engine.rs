@@ -377,9 +377,11 @@ impl MevEngine {
             mint_states: HashMap::new(),
             account_to_mint: HashMap::new(),
             pending_executor_starts: Vec::new(),
-            // ArcSwap<Vec<Pubkey>>: the bridge reads with one atomic load per batch.
-            // An empty Vec is the correct initial state — accounts are added as
-            // mints are registered below via the for loop.
+            // Initialised as an empty Vec. The shredstream bridge does not start
+            // until run_async, so nothing reads this field while the registration
+            // loop below executes. All tracked accounts are written into this
+            // ArcSwap in a single O(n) pass after every mint has been registered
+            // via register_mint_startup — see the comment after the loop.
             cached_accounts_to_watch: Arc::new(ArcSwap::from(Arc::new(Vec::new()))),
             slot_timing: HashMap::new(),
             // The snapshot map starts empty. Entries are added only when
@@ -390,8 +392,19 @@ impl MevEngine {
         };
 
         for pool_data in mint_pool_data {
-            engine.register_mint(pool_data);
+            engine.register_mint_startup(pool_data);
         }
+
+        // account_to_mint is now fully populated — every tracked account across
+        // every registered mint maps to exactly one mint pubkey, making it the
+        // correct, deduplicated source of truth for the complete account watch list.
+        // A single O(n) pass over its keys builds the Vec the shredstream bridge
+        // reads on every entry batch to decide which account writes to forward as
+        // SpeculativeAccountUpdates. Building the Vec once here — after all
+        // registrations are complete — avoids the O(n²) cost of cloning and
+        // rebuilding the growing Vec inside each register_mint_startup call.
+        let all_accounts: Vec<Pubkey> = engine.account_to_mint.keys().copied().collect();
+        engine.cached_accounts_to_watch.store(Arc::new(all_accounts));
 
         engine
     }
@@ -491,6 +504,91 @@ impl MevEngine {
                 }
             }
             self.cached_accounts_to_watch.store(Arc::new(new_vec));
+        }
+
+        let tracked_count = tracked_accounts.len();
+
+        self.mint_states.insert(
+            mint,
+            MintState {
+                pool_data: pool_data_swap,
+                arb_graph,
+                pool_update_tx,
+                tracked_accounts,
+            },
+        );
+
+        info!(
+            "MevEngine: registered mint {} ({} tracked accounts)",
+            mint, tracked_count
+        );
+    }
+
+    /// Startup-only variant of [`register_mint`] used exclusively during [`MevEngine::new`]
+    /// when initialising the engine with the full batch of pre-loaded pool data.
+    ///
+    /// The shredstream bridge does not start until [`run_async`] is called. Because
+    /// nothing reads `cached_accounts_to_watch` while this method executes, updating
+    /// it on every call would be pure waste. This method omits that update entirely.
+    /// After the registration loop in [`new`] completes, a single O(n) pass over
+    /// `account_to_mint` builds the full deduplicated account Vec and stores it
+    /// atomically into `cached_accounts_to_watch` — one allocation for all mints
+    /// combined, rather than one allocation per mint.
+    ///
+    /// To understand why the incremental approach is O(n²): each call to the
+    /// equivalent block in `register_mint` loads the current Vec (which grows by ~3
+    /// entries per call), clones the entire thing, builds a HashSet from the clone
+    /// to detect duplicates, appends the new accounts, and stores a fresh Arc.
+    /// By the time the 2.14 millionth mint is registered the Vec holds roughly
+    /// 6.4 million entries and each iteration copies ~200 MB of pubkey data. The
+    /// cumulative memory traffic across all registrations reaches into the hundreds
+    /// of terabytes, turning what should be a linear initialisation into an
+    /// 18-hour blocking operation on the validator's startup thread.
+    ///
+    /// [`register_mint`] is preserved unchanged for runtime graduation calls, where
+    /// the bridge is already active and `cached_accounts_to_watch` must reflect
+    /// newly discovered vault accounts within the same slot they are detected.
+    fn register_mint_startup(&mut self, pool_data: Arc<MintPoolData>) {
+        let mint = pool_data.mint;
+        if self.mint_states.contains_key(&mint) {
+            return;
+        }
+
+        let config = ArbitrageGraphConfig::default();
+        let arb_graph = Arc::new(RwLock::new(
+            ArbitrageGraph::build_with_config(&pool_data, config)
+        ));
+
+        let tracked_accounts = {
+            let g = arb_graph.read().unwrap();
+            g.all_tracked_accounts()
+        };
+
+        let (pool_update_tx, pool_update_rx) = broadcast::channel(1024);
+
+        let pool_data_swap = Arc::new(ArcSwap::from(pool_data));
+
+        let executor = Arc::new(ArbitrageExecutor::new(
+            Arc::clone(&arb_graph),
+            Arc::clone(&pool_data_swap),
+            Arc::clone(&self.canonical_bank),
+            Arc::clone(&self.wallet),
+            Arc::clone(&self.lut_manager),
+            Arc::clone(&self.rpc_client),
+            self.base_priority_fee,
+            self.min_profit_lamports,
+            self.validation_mode,
+        ));
+
+        self.pending_executor_starts.push((executor, pool_update_rx));
+
+        // account_to_mint is the reverse index the engine queries on every
+        // SpeculativeAccountUpdate to route pool-account writes to the correct
+        // executor. Populating it here is the only mutation that matters during
+        // startup — it is the source of truth from which cached_accounts_to_watch
+        // is built once in MevEngine::new after all mints are registered.
+        for account in &tracked_accounts {
+            self.account_to_mint.insert(*account, mint);
         }
 
         let tracked_count = tracked_accounts.len();
