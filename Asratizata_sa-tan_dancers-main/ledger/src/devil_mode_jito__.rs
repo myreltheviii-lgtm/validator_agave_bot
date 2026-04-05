@@ -819,18 +819,6 @@ impl SpeculativeSlotExecutor {
         }
 
         // ---------------------------------------------------------------------
-        // PERF-1: Pre-compute the owned batch bytes BEFORE acquiring any lock.
-        //
-        // proto_entry_bytes.to_vec() allocates a new Vec<u8> and copies every byte
-        // of the shredstream payload.  If this call were inside the write lock that
-        // follows, it would hold the exclusive slot_banks lock for the duration of
-        // the malloc + memcpy — blocking every concurrent execute() call for every
-        // slot in the system.  Computing it here, while holding no lock, removes
-        // that allocation from the critical section entirely.
-        // ---------------------------------------------------------------------
-        let batch_bytes: Vec<u8> = proto_entry_bytes.to_vec();
-
-        // ---------------------------------------------------------------------
         // Step 2: Locate or create the working bank for this slot.
         //
         // Two-phase locking strategy:
@@ -899,19 +887,10 @@ impl SpeculativeSlotExecutor {
                 // the write lock is acquired. This is safe: we hold no Entry into
                 // the map at this point, so this is just a plain HashMap lookup
                 // under a shared lock that completes and drops immediately.
-                // Track whether the parent was found in our own speculative cache
-                // (slot_banks) vs coming from BankForks. This flag drives the race
-                // check below: the race is only possible when the parent was in
-                // slot_banks, because confirm_slot only evicts from slot_banks.
-                // BankForks entries are evicted by set_root, not by confirm_slot,
-                // so the race check must never fire for Level 2 / 3 / 4 parents.
                 let speculative_parent_bank: Option<Arc<Bank>> = {
                     let r = self.slot_banks.read().unwrap();
                     r.get(&parent_slot).map(|s| s.bank.clone())
                 }; // read lock released here
-                // true iff Level 1 fired — parent was in slot_banks.
-                // false for Levels 2, 3, 4 — parent came from BankForks.
-                let parent_was_in_speculative_cache = speculative_parent_bank.is_some();
 
                 // Resolve the parent bank under a single BankForks read-lock acquisition.
                 //
@@ -955,24 +934,57 @@ impl SpeculativeSlotExecutor {
                 //     bug), confirm_slot's child-scan filter (parent_is_canonical==false) would
                 //     skip this child permanently, leaving it forked from the stale root_bank
                 //     forever — uncorrectable stale state propagated indefinitely to the MEV engine.
+                // Track exactly where the parent bank came from so the race check
+                // below can be scoped correctly to Level 1 only.
+                //
+                // The race check detects: "confirm_slot evicted the speculative parent
+                // between our slot_banks read and our slot_banks write." This race only
+                // exists for Level 1 (speculative cache), because:
+                //
+                //   Level 1 parent is IN slot_banks — confirm_slot can evict it.
+                //   Level 2 parent is in BankForks (frozen) — it is never in slot_banks.
+                //   Level 3 parent is in BankForks (active) — it is never in slot_banks;
+                //     furthermore confirm_slot cannot fire for an unfrozen bank.
+                //   Level 4 parent is root_bank() — never in slot_banks.
+                //
+                // Checking `!parent_is_canonical && !w.contains_key(&parent_slot)` would
+                // fire for Levels 3 and 4 (both have parent_is_canonical=false and both
+                // have parent NOT in slot_banks) — returning a spurious ParentBankNotFound
+                // that removes the just-inserted child bank and defeats the entire Level 3
+                // path. This flag prevents that.
+                let parent_from_speculative_cache: bool;
+
                 let (parent_bank, parent_is_canonical) = {
                     let forks = bank_forks.read().unwrap();
 
                     if let Some(bank) = speculative_parent_bank {
                         // Level 1: speculative cache hit — fast path, already resolved above.
+                        // The race check applies: confirm_slot can evict this parent from
+                        // slot_banks between our read and the upcoming write lock.
+                        parent_from_speculative_cache = true;
                         (bank, false)
                     } else if let Some(bank) = forks.get(parent_slot).filter(|b| b.is_frozen()) {
-                        // Level 2: canonical frozen bank — O(1) lookup, no linear scan.
+                        // Level 2: canonical frozen bank — O(1) direct HashMap lookup.
+                        // parent_is_canonical=true; confirm_slot will never need to rebase
+                        // this child. No race possible — parent is in BankForks, not slot_banks.
+                        parent_from_speculative_cache = false;
                         (bank, true)
                     } else if let Some(bank) = forks.get(parent_slot) {
                         // Level 3: parent is active and currently being replayed by canonical
-                        // replay. This is the common shredstream-ahead-of-canonical case.
-                        // Fork from partial-state parent; rebase fires when parent freezes.
+                        // replay. This is the normal shredstream-ahead-of-canonical case:
+                        // shredstream delivers child entries before the parent is frozen.
+                        // Fork from the partial-state parent; parent_is_canonical=false ensures
+                        // confirm_slot rebases this child when the parent eventually freezes.
+                        // No race possible — confirm_slot fires only for frozen banks.
+                        parent_from_speculative_cache = false;
                         (bank, false)
                     } else {
-                        // Level 4: parent pruned below root — bootstrap approximation.
-                        // parent_is_canonical=false is mandatory so confirm_slot rebases
-                        // this child when the real parent is eventually frozen.
+                        // Level 4: parent slot has been pruned below the current root.
+                        // Bootstrap from root_bank so execution can proceed. parent_is_canonical
+                        // MUST be false — this ensures confirm_slot rebases this child when the
+                        // real parent is subsequently frozen by canonical replay, correcting the
+                        // approximation without any manual intervention. No race possible.
+                        parent_from_speculative_cache = false;
                         warn!(
                             "speculative: parent slot {} pruned below root {}, \
                              bootstrapping child {} from root_bank — will self-correct \
@@ -1014,37 +1026,38 @@ impl SpeculativeSlotExecutor {
                 });
 
                 // -------------------------------------------------------------
-                // RACE CONDITION CHECK — executed under the same write lock
-                // immediately after insertion.
+                // RACE CONDITION CHECK — Level 1 (speculative cache parent) only.
                 //
-                // This race is ONLY possible when the parent came from slot_banks
-                // (Level 1 — parent_was_in_speculative_cache == true).
+                // This check detects the following race window specific to Level 1:
                 //
-                // The race window: between the speculative parent read lock (above,
-                // where we saw parent_slot in slot_banks) and THIS write lock
-                // acquisition, confirm_slot(parent_slot) may have run to completion
-                // on another thread. confirm_slot's sub-phase 1a evicts parent_slot
-                // from slot_banks. It scanned for children, found none (this child
-                // did not exist yet), completed the rebase cycle, and returned.
-                // It will never run again for parent_slot.
+                //   Between the slot_banks read lock above (where we found parent_slot
+                //   in slot_banks and set parent_from_speculative_cache=true) and the
+                //   slot_banks write lock here, confirm_slot(parent_slot) may have run
+                //   to completion on the MevEngine thread. confirm_slot sub-phase 1a
+                //   removes parent_slot from slot_banks. It then scanned for speculative
+                //   children (parent_slot == this_parent && !parent_is_canonical) and
+                //   found none because this child did not yet exist. The rebase cycle
+                //   completed and confirm_slot will never run again for parent_slot.
                 //
-                // Consequence: this child was forked from a now-superseded speculative
-                // parent. No future confirm_slot call will rebase it — confirm_slot
-                // fires exactly once per slot. Recovery: remove the just-inserted
-                // entry, return ParentBankNotFound. The caller retries and finds
-                // parent_slot now frozen in BankForks (Level 2), forks from that
-                // verified canonical parent, and proceeds correctly.
+                //   Consequence: this child was forked from the OLD speculative parent
+                //   Arc — state superseded by the canonical bank. parent_is_canonical=false
+                //   means it is marked for rebase, but no future confirm_slot will ever
+                //   trigger that rebase because confirm_slot fires exactly once per slot.
                 //
-                // WHY NOT LEVELS 2 / 3 / 4:
-                // For BankForks-sourced parents (Levels 2, 3, 4), slot_banks never
-                // contained the parent. w.contains_key(&parent_slot) is ALWAYS false
-                // for them — not because of a race, but because they were never there.
-                // Applying the race check to those levels would misfire on every hit,
-                // returning ParentBankNotFound and nullifying the entire Level 3/4
-                // bootstrap fix. The parent_was_in_speculative_cache guard prevents
-                // this: the check only runs when slot_banks actually held the parent.
+                //   Recovery: remove the just-inserted child and return ParentBankNotFound.
+                //   The caller retries. On retry, parent_slot is now in BankForks (frozen),
+                //   so Level 2 resolves it with parent_is_canonical=true — no rebase needed.
+                //
+                // This check MUST NOT fire for Levels 2, 3, or 4:
+                //   Level 2: parent_is_canonical=true — skipped automatically.
+                //   Level 3: parent is in BankForks (active), NOT in slot_banks. The old
+                //     condition (!parent_is_canonical && !w.contains_key) would fire here
+                //     spuriously because Level 3 also has parent_is_canonical=false and the
+                //     parent is not in slot_banks. parent_from_speculative_cache=false prevents
+                //     that false positive.
+                //   Level 4: same spurious-fire problem as Level 3 with the old condition.
                 // -------------------------------------------------------------
-                if parent_was_in_speculative_cache && !w.contains_key(&parent_slot) {
+                if parent_from_speculative_cache && !w.contains_key(&parent_slot) {
                     w.remove(&slot);
                     return Err(SpeculativeExecutorError::ParentBankNotFound {
                         parent_slot,
@@ -1056,6 +1069,22 @@ impl SpeculativeSlotExecutor {
                 pair
                 // Write lock drops here.
             };
+
+        // ---------------------------------------------------------------------
+        // PERF: Allocate the owned batch bytes NOW — after Phase 1 succeeds and
+        // all locks are released.
+        //
+        // proto_entry_bytes.to_vec() allocates a full copy of the shredstream
+        // batch payload (up to several MB for a dense block). Placing it here
+        // means it is skipped entirely on every failure path that returns before
+        // this point: SlotCompleted (line above RACE-3 guard), Rebasing (Phase 1
+        // read lock), and the speculative-cache race check (Phase 1 write lock).
+        //
+        // It must remain OUTSIDE the Step 5 write lock: holding slot_banks.write()
+        // for the duration of a malloc+memcpy would serialize every concurrent
+        // execute() read for every other active slot for the full copy duration.
+        // ---------------------------------------------------------------------
+        let batch_bytes: Vec<u8> = proto_entry_bytes.to_vec();
 
         // ---------------------------------------------------------------------
         // Step 3: Capture the per-batch pre-execution baseline.
@@ -1073,10 +1102,22 @@ impl SpeculativeSlotExecutor {
         // changed, and so on — turning each delivery into an ever-growing superset
         // of the entire slot's accumulated changes rather than a precise report of
         // what this one delivery contributed.
+        //
+        // PERF: Vec<Option<AccountSharedData>> instead of HashMap<Pubkey, ...>.
+        //
+        // The pre-state is indexed by position, matching the order of
+        // accounts_to_watch. Both Step 3 (build) and Step 6 (compare) iterate
+        // accounts_to_watch in the same slice order, so zipping the two Vecs in
+        // Step 6 gives direct positional access with zero hashing. A HashMap would
+        // hash every pubkey twice per batch (once on insert here, once on lookup in
+        // Step 6) and would be pre-allocated by the stdlib at accounts_to_watch.len()
+        // capacity — potentially millions of entries — even though 0–5 accounts
+        // typically change per batch. The Vec approach replaces that with a single
+        // flat allocation exactly accounts_to_watch.len() entries wide.
         // ---------------------------------------------------------------------
-        let pre_execution_state: HashMap<Pubkey, Option<AccountSharedData>> = accounts_to_watch
+        let pre_execution_state: Vec<Option<AccountSharedData>> = accounts_to_watch
             .iter()
-            .map(|pubkey| (*pubkey, working_bank.get_account(pubkey)))
+            .map(|pubkey| working_bank.get_account(pubkey))
             .collect();
 
         // ---------------------------------------------------------------------
@@ -1228,29 +1269,35 @@ impl SpeculativeSlotExecutor {
         // ---------------------------------------------------------------------
         // Compute the per-batch account delta.
         //
-        // `pre_execution_state` holds `Option<AccountSharedData>` values captured
-        // before SVM execution.  Comparing by reference (`pre_state == &post`)
-        // avoids cloning the `AccountSharedData` entirely — `AccountSharedData`
-        // owns a heap-allocated data Vec that can be tens of kilobytes for large
-        // accounts.  Cloning it on every watched account on every batch would add
-        // substantial allocator pressure on the hot path.  Comparing references
-        // is zero-cost and semantically identical: `PartialEq` on `AccountSharedData`
-        // compares all fields including the data slice, so no information is lost.
-        let accounts: HashMap<Pubkey, AccountSharedData> = accounts_to_watch
-            .iter()
-            .filter_map(|pubkey| {
-                let post = working_bank.get_account(pubkey)?;
-                // `pre` is Option<&AccountSharedData> — a reference into the
-                // pre-execution snapshot map.  No clone of AccountSharedData occurs.
-                let pre: Option<&AccountSharedData> = pre_execution_state
-                    .get(pubkey)
-                    .and_then(|opt| opt.as_ref());
-                match pre {
-                    Some(pre_state) if pre_state == &post => None,
-                    _ => Some((*pubkey, post)),
+        // `pre_execution_state` is a Vec positionally indexed to accounts_to_watch.
+        // Zipping the two slices gives direct per-account access with zero hashing.
+        //
+        // PERF: HashMap::new() + loop instead of filter_map().collect().
+        // filter_map().collect() uses the iterator's size_hint upper bound to
+        // pre-allocate the HashMap — for a slice iterator that is accounts_to_watch.len(),
+        // potentially millions of entries. HashMap::new() starts at capacity 0 and
+        // grows only when a genuinely changed account is inserted. Typical batches
+        // touch 0–5 watched accounts, so this reduces the allocation from O(n_watched)
+        // to O(n_changed) — typically zero to one small allocations per batch.
+        //
+        // Comparing AccountSharedData by value (`pre_state == &post`) avoids cloning.
+        // AccountSharedData owns a heap-allocated data Vec (potentially tens of KB).
+        // PartialEq compares all fields including the data slice — no information lost.
+        let mut accounts: HashMap<Pubkey, AccountSharedData> = HashMap::new();
+        for (pubkey, pre) in accounts_to_watch.iter().zip(pre_execution_state.iter()) {
+            if let Some(post) = working_bank.get_account(pubkey) {
+                let unchanged = match pre {
+                    Some(pre_state) => pre_state == &post,
+                    None => false,
+                };
+                if !unchanged {
+                    accounts.insert(*pubkey, post);
                 }
-            })
-            .collect();
+            }
+            // post == None: account closed this batch. Closed accounts are excluded
+            // from the delta — callers detect deletion by observing absence in a
+            // subsequent update relative to a prior one that contained the account.
+        }
 
         Ok(SpeculativeAccountUpdate { slot, accounts, is_correction: false })
     }
@@ -1637,20 +1684,25 @@ impl SpeculativeSlotExecutor {
                         // the now-verified parent. The caller replaces their accumulated
                         // prior speculative result for this child slot with this single
                         // correction.
-                        Some((
-                            accumulated_tx_count,
-                            accounts_to_watch
-                                .iter()
-                                .filter_map(|pubkey| {
-                                    let post = new_bank.get_account(pubkey)?;
-                                    let pre = canonical_bank.get_account(pubkey);
-                                    match pre {
-                                        Some(ref pre_state) if pre_state == &post => None,
-                                        _ => Some((*pubkey, post)),
-                                    }
-                                })
-                                .collect::<HashMap<Pubkey, AccountSharedData>>(),
-                        ))
+                        //
+                        // PERF: HashMap::new() + loop instead of filter_map().collect().
+                        // Same rationale as in execute() Step 6: starts at 0 capacity,
+                        // grows only for accounts that genuinely changed, avoiding
+                        // pre-allocation sized to all of accounts_to_watch.
+                        let mut delta: HashMap<Pubkey, AccountSharedData> = HashMap::new();
+                        for pubkey in accounts_to_watch.iter() {
+                            if let Some(post) = new_bank.get_account(pubkey) {
+                                let pre = canonical_bank.get_account(pubkey);
+                                let unchanged = match pre {
+                                    Some(ref pre_state) => pre_state == &post,
+                                    None => false,
+                                };
+                                if !unchanged {
+                                    delta.insert(*pubkey, post);
+                                }
+                            }
+                        }
+                        Some((accumulated_tx_count, delta))
                     }
                 } else {
                     // A previous child failed. Skip Stage A for this child entirely.

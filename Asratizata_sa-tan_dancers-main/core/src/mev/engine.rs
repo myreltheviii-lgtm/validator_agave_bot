@@ -1241,6 +1241,23 @@ impl MevEngine {
                 );
             }
         }
+
+        // Prune completed_slots to bound its memory growth. The set accumulates
+        // every confirmed or condemned slot and is never evicted without explicit
+        // pruning. At 2.5 slots per second this is ~216 000 entries per day.
+        //
+        // Pruning at the current root is safe: BankForks.set_root() permanently
+        // removes all banks below the new root, so execute() cannot receive a
+        // shredstream batch for a sub-root slot whose parent resolution would
+        // succeed — Level 3 and 4 return None for pruned parents, and the
+        // resulting ParentBankNotFound causes the caller to drop the batch.
+        // Removing sub-root slots from completed_slots therefore cannot cause any
+        // bank to be re-created. The bank_forks read lock is held for one .root()
+        // call — microseconds — and no other lock is held at this point.
+        {
+            let root = self.bank_forks.read().unwrap().root();
+            self.speculative_executor.prune_completed_before(root);
+        }
     }
 
     /// Phase 2 of the graduation pipeline.
