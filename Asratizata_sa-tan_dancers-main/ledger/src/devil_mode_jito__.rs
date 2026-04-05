@@ -899,10 +899,19 @@ impl SpeculativeSlotExecutor {
                 // the write lock is acquired. This is safe: we hold no Entry into
                 // the map at this point, so this is just a plain HashMap lookup
                 // under a shared lock that completes and drops immediately.
+                // Track whether the parent was found in our own speculative cache
+                // (slot_banks) vs coming from BankForks. This flag drives the race
+                // check below: the race is only possible when the parent was in
+                // slot_banks, because confirm_slot only evicts from slot_banks.
+                // BankForks entries are evicted by set_root, not by confirm_slot,
+                // so the race check must never fire for Level 2 / 3 / 4 parents.
                 let speculative_parent_bank: Option<Arc<Bank>> = {
                     let r = self.slot_banks.read().unwrap();
                     r.get(&parent_slot).map(|s| s.bank.clone())
                 }; // read lock released here
+                // true iff Level 1 fired — parent was in slot_banks.
+                // false for Levels 2, 3, 4 — parent came from BankForks.
+                let parent_was_in_speculative_cache = speculative_parent_bank.is_some();
 
                 // Resolve the parent bank under a single BankForks read-lock acquisition.
                 //
@@ -1008,34 +1017,34 @@ impl SpeculativeSlotExecutor {
                 // RACE CONDITION CHECK — executed under the same write lock
                 // immediately after insertion.
                 //
+                // This race is ONLY possible when the parent came from slot_banks
+                // (Level 1 — parent_was_in_speculative_cache == true).
+                //
                 // The race window: between the speculative parent read lock (above,
-                // where we saw parent_slot in slot_banks and resolved parent_is_canonical
-                // = false) and THIS write lock acquisition, confirm_slot(parent_slot)
-                // may have run to completion on another thread. confirm_slot's
-                // sub-phase 1a evicts parent_slot from slot_banks via w.remove(&slot).
-                // It then scanned for children with parent_slot == this slot's parent
-                // and found none (because this child did not exist yet). It completed
-                // the rebase cycle and returned. It will never run again for parent_slot.
+                // where we saw parent_slot in slot_banks) and THIS write lock
+                // acquisition, confirm_slot(parent_slot) may have run to completion
+                // on another thread. confirm_slot's sub-phase 1a evicts parent_slot
+                // from slot_banks. It scanned for children, found none (this child
+                // did not exist yet), completed the rebase cycle, and returned.
+                // It will never run again for parent_slot.
                 //
-                // The consequence: this child bank was forked from the OLD speculative
-                // parent Arc — state that has now been superseded by the canonical bank.
-                // The child is marked parent_is_canonical = false, but no future
-                // confirm_slot call will ever trigger the rebase it needs, because
-                // confirm_slot fires exactly once per slot.
+                // Consequence: this child was forked from a now-superseded speculative
+                // parent. No future confirm_slot call will rebase it — confirm_slot
+                // fires exactly once per slot. Recovery: remove the just-inserted
+                // entry, return ParentBankNotFound. The caller retries and finds
+                // parent_slot now frozen in BankForks (Level 2), forks from that
+                // verified canonical parent, and proceeds correctly.
                 //
-                // Detection: under this write lock, parent_slot's entry in slot_banks
-                // is the authoritative source of truth. If parent_is_canonical was
-                // false (we thought the parent was speculative) but parent_slot is
-                // no longer in slot_banks, confirm_slot already evicted it — the
-                // parent IS canonical and the child was mis-forked.
-                //
-                // Recovery: remove the just-inserted entry and return ParentBankNotFound.
-                // The caller retries, finds parent_slot in BankForks.frozen_banks()
-                // (it is now canonical and frozen), forks the child from that verified
-                // parent with parent_is_canonical = true, and proceeds with correct
-                // single-generation speculative ancestry.
+                // WHY NOT LEVELS 2 / 3 / 4:
+                // For BankForks-sourced parents (Levels 2, 3, 4), slot_banks never
+                // contained the parent. w.contains_key(&parent_slot) is ALWAYS false
+                // for them — not because of a race, but because they were never there.
+                // Applying the race check to those levels would misfire on every hit,
+                // returning ParentBankNotFound and nullifying the entire Level 3/4
+                // bootstrap fix. The parent_was_in_speculative_cache guard prevents
+                // this: the check only runs when slot_banks actually held the parent.
                 // -------------------------------------------------------------
-                if !parent_is_canonical && !w.contains_key(&parent_slot) {
+                if parent_was_in_speculative_cache && !w.contains_key(&parent_slot) {
                     w.remove(&slot);
                     return Err(SpeculativeExecutorError::ParentBankNotFound {
                         parent_slot,
