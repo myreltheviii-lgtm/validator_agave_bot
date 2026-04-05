@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use solana_pubkey::Pubkey;
 use tracing::info;
 
@@ -19,6 +19,17 @@ use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
 
 /// Signals that a pool account was modified by speculative or canonical execution
 /// and that affected arbitrage pairs should be re-evaluated.
+///
+/// # Bank lifetime and RAM
+///
+/// `speculative_bank` is an `Arc<Bank>`. Agave banks are large — a single
+/// speculative bank for an active slot holds all accounts touched during
+/// speculative entry execution and can reach hundreds of megabytes. The
+/// executor MUST drop the `Arc<Bank>` (by dropping the whole event or by
+/// explicitly taking and dropping just this field) as soon as it has finished
+/// reading account state from it. Holding unconsumed events in a broadcast
+/// channel buffer while the bank reference is live is the primary mechanism
+/// driving unbounded RAM growth in the MEV pipeline.
 #[derive(Clone)]
 pub struct MevPoolUpdateEvent {
     /// The pool state address (vault, tick array, etc.) that changed.
@@ -84,7 +95,16 @@ pub enum PoolType {
     Futarchy,
 }
 
-#[derive(Clone, Debug)]
+/// Lightweight descriptor for a single pool tracked by the arb graph.
+///
+/// All fields are `Copy` types (`Pubkey` is `[u8; 32]`, `PoolType` is a plain
+/// enum with no payload). Deriving `Copy` here means that every `.clone()` at
+/// call sites — in `to_path()`, `add_pool()`, and `build_with_config()` — is
+/// lowered by the compiler to a 97-byte stack copy with no heap allocation and
+/// no trait dispatch. Without `Copy`, the `Clone` impl walks fields one-by-one
+/// through the trait mechanism even though the outcome is identical; the compiler
+/// cannot optimise across the trait boundary in all cases.
+#[derive(Clone, Copy, Debug)]
 pub struct PoolInfo {
     pub address: Pubkey,
     pub pool_type: PoolType,
@@ -141,21 +161,28 @@ impl ArbitragePath {
         }
     }
 
-    /// Returns the on-chain addresses of both pools.
+    /// Returns the on-chain addresses of both pools as a fixed-size array.
     ///
-    /// Implemented by matching directly rather than calling `self.pools()` so only
-    /// one Vec is allocated. If this method called `pools()` it would allocate a
-    /// `[&PoolInfo; 2]` stack value, then iterate it to produce a `Vec<Pubkey>` —
-    /// effectively paying for two collection operations where one suffices.
-    pub fn pool_addresses(&self) -> Vec<Pubkey> {
+    /// Returning `[Pubkey; 2]` eliminates a two-element heap allocation on every
+    /// call. This method is on the hot path — called per arb opportunity per slot.
+    /// Arrays are `IntoIterator` and support index access identically to `Vec`, so
+    /// all call sites remain source-compatible without modification.
+    pub fn pool_addresses(&self) -> [Pubkey; 2] {
         match self {
-            Self::TwoHop { pool_1, pool_2, .. } => vec![pool_1.address, pool_2.address],
+            Self::TwoHop { pool_1, pool_2, .. } => [pool_1.address, pool_2.address],
         }
     }
 
-    pub fn intermediate_tokens(&self) -> Vec<Pubkey> {
+    /// Returns the single intermediate token for this two-hop path.
+    ///
+    /// Because `ArbitragePath` is always `TwoHop` there is exactly one intermediate
+    /// token. Returning it directly as a `Pubkey` (`Copy`, 32 bytes on the stack)
+    /// eliminates the single-element `Vec<Pubkey>` that a previous `intermediate_tokens()`
+    /// design would allocate on every hot-path call. Callers should use this value
+    /// directly rather than wrapping it in a collection.
+    pub fn intermediate_token(&self) -> Pubkey {
         match self {
-            Self::TwoHop { intermediate_token, .. } => vec![*intermediate_token],
+            Self::TwoHop { intermediate_token, .. } => *intermediate_token,
         }
     }
 
@@ -192,9 +219,12 @@ impl PoolPair {
             self.shared_token_b
         };
 
+        // PoolInfo is Copy, so these are 97-byte stack copies with no heap allocation
+        // and no trait dispatch. This method is on the hot path (called per arb
+        // opportunity per slot), so the Copy bound is load-bearing for latency.
         ArbitragePath::TwoHop {
-            pool_1: self.pool_1.clone(),
-            pool_2: self.pool_2.clone(),
+            pool_1: self.pool_1,
+            pool_2: self.pool_2,
             intermediate_token,
         }
     }
@@ -216,12 +246,26 @@ pub struct ArbitrageGraph {
     pool_to_pairs: FxHashMap<Pubkey, Vec<usize>>,
     pairs: Vec<PoolPair>,
     account_to_pool: FxHashMap<Pubkey, Pubkey>,
-    // The complete list of every PoolInfo ever added to the graph, preserved
-    // so that add_pool can pair a new pool against all existing pools by
-    // iterating this vec. Without it we would need to reconstruct PoolInfos
-    // from the pairs vec, which has O(pairs) cost and would require de-duplicating
-    // pools that appear in multiple pairs.
+    // The complete list of every PoolInfo ever added to the graph, preserved so
+    // that add_pool can access any existing pool by index in O(1). Without this Vec
+    // we would need to reconstruct PoolInfos from the pairs Vec, which has O(pairs)
+    // cost and requires de-duplicating pools that appear in multiple pairs.
     all_pools: Vec<PoolInfo>,
+    // Reverse index: canonical token-pair key → Vec of indices into all_pools.
+    // The canonical key sorts the two mint pubkeys so (A,B) and (B,A) map to the
+    // same bucket. This lets add_pool find all existing pools for the same token
+    // pair in O(1) map lookup + O(matching_count) iteration, replacing an O(N)
+    // linear scan over all_pools that becomes progressively more expensive as new
+    // pools arrive throughout the validator's lifetime.
+    token_pair_to_pool_indices: FxHashMap<(Pubkey, Pubkey), Vec<usize>>,
+    // Set of every pool address registered so far. add_pool consults this before
+    // doing any work: if the address is already present the call is a no-op.
+    // Without this guard a duplicate registration (e.g., the same pool-creation
+    // ShredStream event arriving twice) would find its own first copy in all_pools,
+    // pass the tokens_match check (identical mints), and produce a PoolPair between
+    // a pool and itself — a degenerate two-hop path that pays fees twice and returns
+    // nothing, and may fail instruction building due to duplicate account references.
+    known_pool_addresses: FxHashSet<Pubkey>,
     config: ArbitrageGraphConfig,
 }
 
@@ -250,20 +294,33 @@ fn tokens_match(pool_a: &PoolInfo, pool_b: &PoolInfo) -> bool {
         || (pool_a.token_x == pool_b.token_y && pool_a.token_y == pool_b.token_x)
 }
 
-// Returns the two tokens (shared_token_a, shared_token_b) for the pair, where
-// shared_token_a is the token that appears in both pools at the same or swapped
-// position. The caller uses these to determine which token is the quote currency
-// (base) and which is the intermediate (speculative) token.
+// Returns (shared_token_a, shared_token_b) for the pair. The two tokens are the
+// same for both pools — pool_a's token pair is exactly pool_b's token pair in
+// some orientation. The result is expressed in pool_a's orientation: if pool_a
+// and pool_b share token_x (either directly or via swap), shared_token_a is
+// pool_a.token_x; if they share token_y, shared_token_a is pool_a.token_y.
+// The caller uses the two returned tokens to classify which is the quote currency
+// and which is the speculative intermediate.
 fn get_shared_tokens(pool_a: &PoolInfo, pool_b: &PoolInfo) -> (Pubkey, Pubkey) {
-    if pool_a.token_x == pool_b.token_x {
+    // The four-branch form in the original was dead: branches 1 and 2 both produced
+    // (pool_a.token_x, pool_a.token_y), and branches 3 and 4 both produced
+    // (pool_a.token_y, pool_a.token_x). Collapsed to the two actual cases.
+    if pool_a.token_x == pool_b.token_x || pool_a.token_x == pool_b.token_y {
+        // pool_a.token_x is the token that appears in both pools (directly or swapped).
         (pool_a.token_x, pool_a.token_y)
-    } else if pool_a.token_x == pool_b.token_y {
-        (pool_a.token_x, pool_a.token_y)
-    } else if pool_a.token_y == pool_b.token_x {
-        (pool_a.token_y, pool_a.token_x)
     } else {
+        // pool_a.token_y is the token that appears in both pools.
         (pool_a.token_y, pool_a.token_x)
     }
+}
+
+// Produces the canonical sort key for a token pair. Sorting by raw byte order
+// ensures (A, B) and (B, A) always map to the same FxHashMap bucket, so a pool
+// whose token orientation is mirrored relative to an existing pool is still found
+// by the same key lookup in token_pair_to_pool_indices.
+#[inline(always)]
+fn canonical_pair_key(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
+    if a < b { (a, b) } else { (b, a) }
 }
 
 // Build the reverse index: every account pubkey that appears in any parsed pool
@@ -501,27 +558,32 @@ impl ArbitrageGraph {
 
         info!("Total pools collected for graph building: {}", all_pools.len());
 
-        // Group pools by their canonical token-pair key so that only pools
-        // containing the same two tokens are compared as potential arb partners.
-        // The canonical key sorts the two token pubkeys so that (A, B) and (B, A)
-        // produce the same bucket, preventing duplicate pairs.
-        let mut token_pair_groups: FxHashMap<(Pubkey, Pubkey), Vec<usize>> = FxHashMap::default();
+        // Build the token-pair index and known-address deduplication set in a single
+        // pass. The canonical key sorts the two mint pubkeys so (A, B) and (B, A)
+        // produce the same bucket, preventing duplicate index entries for mirrored pairs.
+        let mut token_pair_to_pool_indices: FxHashMap<(Pubkey, Pubkey), Vec<usize>> =
+            FxHashMap::default();
+        let mut known_pool_addresses: FxHashSet<Pubkey> = FxHashSet::default();
 
         for (idx, pool) in all_pools.iter().enumerate() {
             if !pool_has_quote(pool) {
                 continue;
             }
-
-            let key = if pool.token_x < pool.token_y {
-                (pool.token_x, pool.token_y)
-            } else {
-                (pool.token_y, pool.token_x)
-            };
-
-            token_pair_groups.entry(key).or_default().push(idx);
+            let key = canonical_pair_key(pool.token_x, pool.token_y);
+            token_pair_to_pool_indices.entry(key).or_default().push(idx);
+            known_pool_addresses.insert(pool.address);
         }
 
-        for pool_indices in token_pair_groups.values() {
+        // Group pools by their canonical token-pair key so that only pools
+        // containing the same two tokens are compared as potential arb partners.
+        // The canonical key sorts the two token pubkeys so that (A, B) and (B, A)
+        // produce the same bucket, preventing duplicate pairs.
+        //
+        // `tokens_match` is NOT called here. Two pools in the same bucket share the
+        // same canonical key by construction — their token pairs are identical in some
+        // orientation. Calling tokens_match would always return true and is dead work.
+        // The allow_same_dex_pairs check is the only real gate inside this loop.
+        for pool_indices in token_pair_to_pool_indices.values() {
             if pool_indices.len() < 2 {
                 continue;
             }
@@ -535,20 +597,19 @@ impl ArbitrageGraph {
                         continue;
                     }
 
-                    if tokens_match(pool_a, pool_b) {
-                        let pair_idx = pairs.len();
-                        let shared_tokens = get_shared_tokens(pool_a, pool_b);
+                    let pair_idx = pairs.len();
+                    let shared_tokens = get_shared_tokens(pool_a, pool_b);
 
-                        pairs.push(PoolPair {
-                            pool_1: pool_a.clone(),
-                            pool_2: pool_b.clone(),
-                            shared_token_a: shared_tokens.0,
-                            shared_token_b: shared_tokens.1,
-                        });
+                    // PoolInfo is Copy, so these are stack copies with no heap allocation.
+                    pairs.push(PoolPair {
+                        pool_1: *pool_a,
+                        pool_2: *pool_b,
+                        shared_token_a: shared_tokens.0,
+                        shared_token_b: shared_tokens.1,
+                    });
 
-                        pool_to_pairs.entry(pool_a.address).or_default().push(pair_idx);
-                        pool_to_pairs.entry(pool_b.address).or_default().push(pair_idx);
-                    }
+                    pool_to_pairs.entry(pool_a.address).or_default().push(pair_idx);
+                    pool_to_pairs.entry(pool_b.address).or_default().push(pair_idx);
                 }
             }
         }
@@ -564,6 +625,8 @@ impl ArbitrageGraph {
             pairs,
             account_to_pool,
             all_pools,
+            token_pair_to_pool_indices,
+            known_pool_addresses,
             config,
         }
     }
@@ -595,28 +658,54 @@ impl ArbitrageGraph {
     /// registration for the same token pair would pair with it at that time.
     pub fn add_pool(&mut self, new_pool: PoolInfo, pool_accounts: &[Pubkey]) -> usize {
         // A pool with no quote side cannot participate in any two-hop path.
-        // Reject it early to avoid polluting all_pools with dead entries that
-        // would be matched against — and rejected during — every future add_pool call.
+        // Reject it early to avoid polluting all_pools with dead entries.
         if !pool_has_quote(&new_pool) {
+            return 0;
+        }
+
+        // Deduplication: if this address is already registered — e.g., the same
+        // pool-creation ShredStream event arrived twice, or a rebase correction
+        // re-triggered the graduation path — return immediately. Without this guard
+        // the second call would find the first copy in all_pools, tokens_match would
+        // return true (identical mints), and a PoolPair would be created between a
+        // pool and itself: a degenerate two-hop path that pays swap fees twice and
+        // earns nothing, and may cause instruction-building failures from the duplicate
+        // writable account reference in the same transaction.
+        if !self.known_pool_addresses.insert(new_pool.address) {
             return 0;
         }
 
         // Register every account that belongs to this pool in the reverse index.
         // From this moment, any SpeculativeAccountUpdate that touches one of these
-        // accounts will route to this pool's mint via MevEngine::account_to_mint.
+        // accounts will route to this pool's address via account_to_pool.
         for account in pool_accounts {
             self.account_to_pool.insert(*account, new_pool.address);
         }
 
         let mut new_pairs_count = 0;
+        let new_pool_idx = self.all_pools.len(); // index this pool will occupy after push
 
-        // Compare the new pool against every existing pool in the graph.
-        // tokens_match checks both orientations (A/B and B/A), so the canonical
-        // token-pair key sorting used in build_with_config is not needed here.
-        for existing_pool in &self.all_pools {
-            if !pool_has_quote(existing_pool) {
-                continue;
-            }
+        // O(1) lookup: find every existing pool that trades the same token pair by
+        // consulting token_pair_to_pool_indices rather than scanning all_pools linearly.
+        // The previous design iterated self.all_pools entirely on every add_pool call —
+        // O(N) per call, where N grows throughout the validator's lifetime. With this
+        // index the cost is one map lookup plus iteration over only the matching pool
+        // indices, which is O(matching_count) and typically a handful of entries even
+        // for popular mints.
+        //
+        // The matching indices are collected into an owned Vec before the loop so that
+        // the immutable borrow on self.token_pair_to_pool_indices does not conflict with
+        // the mutable borrows on self.pairs and self.pool_to_pairs inside the loop.
+        // The clone is bounded by matching_count (typically < 20) and is negligible.
+        let key = canonical_pair_key(new_pool.token_x, new_pool.token_y);
+        let matching_indices: Vec<usize> = self
+            .token_pair_to_pool_indices
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+
+        for existing_idx in &matching_indices {
+            let existing_pool = self.all_pools[*existing_idx]; // Copy, no borrow needed
 
             // Same-DEX pairs are gated by the graph's allow_same_dex_pairs flag.
             // When false, a new Raydium CLMM pool will not pair with an existing
@@ -625,13 +714,21 @@ impl ArbitrageGraph {
                 continue;
             }
 
-            if tokens_match(existing_pool, &new_pool) {
+            // tokens_match is kept here as a correctness safety net. In add_pool,
+            // unlike in build_with_config, a pool's canonical key can match another
+            // pool's key while tokens_match returns false — this is impossible by
+            // construction in build_with_config but could hypothetically occur in
+            // add_pool if canonical_pair_key ever produces a collision, or if future
+            // code paths call add_pool with non-standard token orientations. The cost
+            // of the check in this non-hot-path function is negligible.
+            if tokens_match(&existing_pool, &new_pool) {
                 let pair_idx = self.pairs.len();
-                let shared_tokens = get_shared_tokens(existing_pool, &new_pool);
+                let shared_tokens = get_shared_tokens(&existing_pool, &new_pool);
 
+                // PoolInfo is Copy — both insertions are 97-byte stack copies.
                 self.pairs.push(PoolPair {
-                    pool_1: existing_pool.clone(),
-                    pool_2: new_pool.clone(),
+                    pool_1: existing_pool,
+                    pool_2: new_pool,
                     shared_token_a: shared_tokens.0,
                     shared_token_b: shared_tokens.1,
                 });
@@ -646,9 +743,19 @@ impl ArbitrageGraph {
             }
         }
 
-        // Append the new pool to all_pools AFTER the comparison loop to avoid
-        // pairing it with itself, and so that subsequent add_pool calls for
-        // other new pools can find this one as an existing pool to pair against.
+        // Register the new pool in the token-pair index so that future add_pool calls
+        // for pools trading the same pair can find it. This is done after the matching
+        // loop to avoid the pool finding itself (new_pool_idx is not in the index yet
+        // when the loop runs, so no self-pairing can occur even before the deduplication
+        // guard above was added — both defences are independent and correct together).
+        self.token_pair_to_pool_indices
+            .entry(key)
+            .or_default()
+            .push(new_pool_idx);
+
+        // Append the new pool to all_pools AFTER everything else. The index entry above
+        // stores new_pool_idx = self.all_pools.len() pre-push, which is exactly the
+        // index the element will occupy after this push — consistent by construction.
         self.all_pools.push(new_pool);
 
         new_pairs_count

@@ -29,7 +29,7 @@ use solana_runtime::bank::Bank;
 use solana_pubkey::Pubkey;
 use std::sync::Arc;
 use anyhow::Result;
-use tracing::{warn, error, info};
+use tracing::{warn, error, info, debug};
 
 pub fn parse_raydium_v4_pools(
     bank: &Arc<Bank>,
@@ -60,11 +60,24 @@ pub fn parse_raydium_v4_pools(
         }
 
         // Raydium V4 stores one token as "coin" and the other as "pc" (price currency).
-        // The convention is that whichever side is SOL becomes sol_vault, the other is token_vault.
+        // The vault assignment mirrors every other parser in this file: SOL (the quote
+        // currency this system arbs against) is identified explicitly by checking which
+        // side matches SOL_MINT. Without this explicit check, a USDC/TOKEN or USDT/TOKEN
+        // pool would enter the else branch and silently assign the wrong vault — the
+        // speculative-token vault would end up in sol_vault and the USDC vault in
+        // token_vault, inverting the accounts the instruction builder expects.
         let (sol_vault, token_vault) = if sol == amm_info.coin_mint {
             (amm_info.coin_vault, amm_info.pc_vault)
-        } else {
+        } else if sol == amm_info.pc_mint {
             (amm_info.pc_vault, amm_info.coin_vault)
+        } else {
+            // Neither token is SOL. The CLMM, CPMM, Whirlpool, Byreal, and PancakeSwap
+            // parsers all reject non-SOL pools for the same reason: the instruction
+            // builder's vault slot labelled "sol_vault" must hold the native-SOL token
+            // account. USDC/USDT/USD1-paired V4 pools are therefore unsupported until
+            // the instruction builder is extended to handle stablecoin quote sides.
+            error!("SOL is not present in Raydium V4 pool {}", pool_addresses[idx]);
+            continue;
         };
 
         let (token_mint, base_mint) = if *mint == amm_info.coin_mint {
@@ -81,7 +94,11 @@ pub fn parse_raydium_v4_pools(
             base_mint,
         });
 
-        info!("Raydium pool added: {}", pool_addresses[idx]);
+        // Per-pool confirmation is debug-level. At startup with thousands of V4 pools
+        // this line would otherwise encode thousands of Pubkeys to base58 at info level,
+        // adding hundreds of milliseconds of pure formatting overhead before the
+        // validator is ready to trade. Use RUST_LOG=debug to enable per-pool tracing.
+        debug!("Raydium pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -140,7 +157,7 @@ pub fn parse_raydium_cpmm_pools(
             base_mint,
         });
 
-        info!("Raydium CP pool added: {}", pool_addresses[idx]);
+        debug!("Raydium CP pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -220,7 +237,10 @@ pub fn parse_raydium_clmm_pools(
             observation_state: pool_state.observation_key,
             x_vault: token_vault,
             y_vault: sol_vault,
-            tick_arrays: tick_arrays.clone(),
+            // tick_arrays is the sole owner of this Vec at this point — get_tick_array_pubkeys
+            // returned it by value and it is not referenced elsewhere in this iteration.
+            // Moving here rather than cloning eliminates a Vec<Pubkey> heap allocation per pool.
+            tick_arrays,
             // memo_program propagated from the mint-level token program detection performed
             // in pool_discovery before this function is called.
             memo_program,
@@ -235,7 +255,7 @@ pub fn parse_raydium_clmm_pools(
             },
         });
 
-        info!("Raydium CLMM pool added: {}", pool_addresses[idx]);
+        debug!("Raydium CLMM pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -362,7 +382,7 @@ pub fn parse_pump_swap_pools(
             pool_v2,
         });
 
-        info!("Pump pool added: {}", pool_addresses[idx]);
+        debug!("Pump pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -461,6 +481,7 @@ pub fn parse_meteora_damm_pools(
 
         let x_token_vault = x_vault_obj.token_vault;
         let sol_token_vault = sol_vault_obj.token_vault;
+
         let x_lp_mint = x_vault_obj.lp_mint;
         let sol_lp_mint = sol_vault_obj.lp_mint;
 
@@ -498,7 +519,7 @@ pub fn parse_meteora_damm_pools(
             base_mint,
         });
 
-        info!("Meteora DAMM pool added: {}", pool_addresses[idx]);
+        debug!("Meteora DAMM pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -558,7 +579,7 @@ pub fn parse_meteora_damm_v2_pools(
             base_mint,
         });
 
-        info!("Meteora DAMM V2 pool added: {}", pool_addresses[idx]);
+        debug!("Meteora DAMM V2 pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -626,7 +647,7 @@ pub fn parse_meteora_dlmm_pools(
             base_mint,
         });
 
-        info!("DLMM pool added: {}", pool_addresses[idx]);
+        debug!("DLMM pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -719,7 +740,7 @@ pub fn parse_orca_whirlpool_pools(
             base_mint,
         });
 
-        info!("Whirlpool pool added: {}", pool_addresses[idx]);
+        debug!("Whirlpool pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -806,7 +827,7 @@ pub fn parse_byreal_pools(
             },
         });
 
-        info!("Byreal pool added: {}", pool_addresses[idx]);
+        debug!("Byreal pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -893,7 +914,7 @@ pub fn parse_pancakeswap_pools(
             },
         });
 
-        info!("PancakeSwap pool added: {}", pool_addresses[idx]);
+        debug!("PancakeSwap pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -947,7 +968,7 @@ pub fn parse_humidifi_pools(
             base_mint,
         });
 
-        info!("Humidifi pool added: {}", pool_addresses[idx]);
+        debug!("Humidifi pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -1013,7 +1034,7 @@ pub fn parse_vertigo_pools(
             base_mint,
         });
 
-        info!("Vertigo pool added: {}", pool_addresses[idx]);
+        debug!("Vertigo pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -1073,7 +1094,7 @@ pub fn parse_heaven_pools(
             token_program: crate::mev::constants::SPL_TOKEN_PROGRAM_ID,
         });
 
-        info!("Heaven pool added: {}", pool_addresses[idx]);
+        debug!("Heaven pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)
@@ -1128,7 +1149,7 @@ pub fn parse_futarchy_pools(
             base_mint,
         });
 
-        info!("Futarchy pool added: {}", pool_addresses[idx]);
+        debug!("Futarchy pool added: {}", pool_addresses[idx]);
     }
 
     Ok(results)

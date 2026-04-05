@@ -906,42 +906,73 @@ impl SpeculativeSlotExecutor {
 
                 // Resolve the parent bank under a single BankForks read-lock acquisition.
                 //
-                // Two-level parent lookup:
+                // Four-level parent lookup — ordered from fastest/most-accurate to
+                // slowest/least-accurate:
                 //
-                //   Level 1 — speculative cache:
-                //     The parent slot may only exist in our speculative cache because
-                //     the canonical pipeline has not yet frozen it. The child bank is
-                //     forked from this speculative parent and marked
-                //     parent_is_canonical = false. It will be REBASED when the parent
-                //     is eventually confirmed, re-executing all stored batches against
-                //     the then-verified canonical parent.
+                //   Level 1 — speculative cache (already resolved above):
+                //     The parent slot is in our own speculative cache. The child inherits
+                //     the parent's speculative write cache state. parent_is_canonical=false
+                //     marks this child for rebase when the parent is later frozen.
                 //
-                //   Level 2 — canonical BankForks:
-                //     The parent slot has been fully replayed, PoH-verified,
-                //     Ed25519-verified, and frozen. frozen_banks() returns only banks
-                //     whose bank.is_frozen() is true. The child bank is marked
-                //     parent_is_canonical = true — no rebase will be needed.
+                //   Level 2 — canonical frozen BankForks (O(1) HashMap get + is_frozen check):
+                //     The parent slot has been fully replayed, PoH-verified, Ed25519-verified,
+                //     and frozen. forks.get() is a direct HashMap lookup — O(1) — followed by
+                //     a trivial atomic read of the frozen flag. This replaces the previous
+                //     frozen_banks().find() which was O(n) over all frozen banks and held the
+                //     BankForks read lock for the entire iteration. parent_is_canonical=true;
+                //     no rebase will ever be needed for this child.
                 //
-                //   Not found:
-                //     Neither location holds the parent. Return ParentBankNotFound
-                //     so the caller can retry.
+                //   Level 3 — active unfrozen BankForks bank:
+                //     The parent slot exists in BankForks but is NOT yet frozen — canonical
+                //     replay is actively executing it right now. This is the normal shredstream
+                //     operating condition: shredstream delivers child entries BEFORE canonical
+                //     replay has finished the parent. The previous code had no Level 3 path,
+                //     which caused a permanent ParentBankNotFound cascade (visible in the logs
+                //     as the same WARN repeating at ~50ms intervals for the same slot pair).
+                //     The child bank is forked from a partial-state parent write cache — this
+                //     is an approximation, but parent_is_canonical=false ensures that when
+                //     canonical replay freezes the parent and fires mev_frozen_bank_sender,
+                //     confirm_slot rebases this child against the verified parent and emits an
+                //     is_correction=true update that replaces all prior speculative deltas.
+                //     The approximation is self-healing, not permanent.
+                //
+                //   Level 4 — root_bank() bootstrap fallback:
+                //     The parent slot has been pruned below the current root (common at startup
+                //     or after a long gap in shredstream delivery). root_bank() always exists.
+                //     parent_is_canonical MUST be false here — not true. With false, when
+                //     canonical replay freezes the real parent (it will, because the validator
+                //     is still running), confirm_slot finds this child with parent_is_canonical=false
+                //     and rebases it against the correct canonical parent. With true (the old
+                //     bug), confirm_slot's child-scan filter (parent_is_canonical==false) would
+                //     skip this child permanently, leaving it forked from the stale root_bank
+                //     forever — uncorrectable stale state propagated indefinitely to the MEV engine.
                 let (parent_bank, parent_is_canonical) = {
                     let forks = bank_forks.read().unwrap();
 
                     if let Some(bank) = speculative_parent_bank {
-                        // Parent is in the speculative cache, not yet canonical.
+                        // Level 1: speculative cache hit — fast path, already resolved above.
+                        (bank, false)
+                    } else if let Some(bank) = forks.get(parent_slot).filter(|b| b.is_frozen()) {
+                        // Level 2: canonical frozen bank — O(1) lookup, no linear scan.
+                        (bank, true)
+                    } else if let Some(bank) = forks.get(parent_slot) {
+                        // Level 3: parent is active and currently being replayed by canonical
+                        // replay. This is the common shredstream-ahead-of-canonical case.
+                        // Fork from partial-state parent; rebase fires when parent freezes.
                         (bank, false)
                     } else {
-                        // Parent must be canonically frozen in BankForks.
-                        let parent = forks
-                            .frozen_banks()
-                            .find(|(s, _)| *s == parent_slot)
-                            .map(|(_, b)| b)
-                            .ok_or(SpeculativeExecutorError::ParentBankNotFound {
-                                parent_slot,
-                                child_slot: slot,
-                            })?;
-                        (parent, true)
+                        // Level 4: parent pruned below root — bootstrap approximation.
+                        // parent_is_canonical=false is mandatory so confirm_slot rebases
+                        // this child when the real parent is eventually frozen.
+                        warn!(
+                            "speculative: parent slot {} pruned below root {}, \
+                             bootstrapping child {} from root_bank — will self-correct \
+                             when parent freezes via confirm_slot rebase",
+                            parent_slot,
+                            forks.root(),
+                            slot,
+                        );
+                        (forks.root_bank(), false)
                     }
                     // BankForks read lock drops here.
                 };
@@ -1765,6 +1796,41 @@ impl SpeculativeSlotExecutor {
         }
 
         condemned
+    }
+
+    /// Remove all entries from `completed_slots` whose slot number is strictly
+    /// less than `root`.
+    ///
+    /// `completed_slots` is a monotonically growing `HashSet<Slot>` that tracks
+    /// every slot that has been confirmed or condemned since the executor started.
+    /// Its purpose is to prevent late shredstream deliveries for already-finalised
+    /// slots from re-creating speculative banks that will never be cleaned up.
+    ///
+    /// Without periodic pruning the set grows at approximately 2.5 entries/second
+    /// on mainnet (one per slot). Over a 24-hour period this is ~216,000 entries
+    /// occupying ~1.7 MB. While small in absolute terms, the set is unbounded and
+    /// will grow for the lifetime of the validator without explicit pruning.
+    ///
+    /// The correct pruning boundary is the current bank forks root: any slot below
+    /// root has been pruned from `BankForks` by `set_root` and therefore can never
+    /// be re-presented to `execute()` via shredstream. Removing those entries from
+    /// `completed_slots` is safe — `execute()` cannot re-create a bank for a slot
+    /// whose parent is below root because `BankForks::get(parent_slot)` returns
+    /// `None` for pruned slots, which falls through to the `root_bank()` bootstrap
+    /// path and then triggers a rebase when the real parent eventually confirms.
+    ///
+    /// Callers should call this method whenever the bank forks root advances,
+    /// passing the new root value. The `MevEngine` can call it from `handle_frozen_bank`
+    /// after receiving a frozen bank whose slot equals or exceeds the current root.
+    ///
+    /// The write lock is held only for the duration of the `retain` scan — O(n)
+    /// over the set but typically very fast because the set stays small when this
+    /// method is called regularly.
+    pub fn prune_completed_before(&self, root: Slot) {
+        self.completed_slots
+            .write()
+            .unwrap()
+            .retain(|&slot| slot >= root);
     }
 
     /// Return a clone of the speculative bank for `slot` if one exists.

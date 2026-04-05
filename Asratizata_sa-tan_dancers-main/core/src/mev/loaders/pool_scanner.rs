@@ -19,7 +19,12 @@ use solana_account::ReadableAccount;
 use solana_runtime::bank::Bank;
 use solana_accounts_db::accounts_index::{IndexKey, ScanConfig};
 use solana_pubkey::Pubkey;
-use std::collections::HashMap;
+// FxHashMap replaces std::collections::HashMap for all Pubkey-keyed maps in this
+// module. The startup scan inserts one entry per unique mint across millions of
+// on-chain accounts; Fx's non-cryptographic hash is 3–4× faster than SipHash for
+// fixed-size keys with no adversarial input, cutting meaningful time off validator
+// startup.
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use anyhow::Result;
 use tracing::{info, warn};
@@ -80,7 +85,25 @@ impl DiscoveredPools {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.total_count() == 0
+        // Short-circuit on the first non-empty sub-vec rather than summing all 14
+        // lengths unconditionally. total_count() always evaluates every .len() call;
+        // for the common case where raydium_v4 or pump is non-empty, the answer is
+        // known after the first check. With millions of DiscoveredPools instances
+        // processed at startup the savings across all calls add up.
+        self.raydium_v4.is_empty()
+            && self.raydium_clmm.is_empty()
+            && self.raydium_cpmm.is_empty()
+            && self.meteora_damm.is_empty()
+            && self.meteora_dammv2.is_empty()
+            && self.meteora_dlmm.is_empty()
+            && self.whirlpool.is_empty()
+            && self.pump.is_empty()
+            && self.byreal.is_empty()
+            && self.pancakeswap.is_empty()
+            && self.humidifi.is_empty()
+            && self.vertigo.is_empty()
+            && self.heaven.is_empty()
+            && self.futarchy.is_empty()
     }
 
     pub fn all_pool_state_pubkeys(&self) -> Vec<Pubkey> {
@@ -104,17 +127,36 @@ impl DiscoveredPools {
 }
 
 pub struct MintDiscoveryResult {
-    pub pools_by_mint: HashMap<Pubkey, DiscoveredPools>,
+    pub pools_by_mint: FxHashMap<Pubkey, DiscoveredPools>,
     pub total_unique_mints: usize,
     pub total_pools: usize,
 }
 
 impl MintDiscoveryResult {
-    pub fn build_pool_state_to_mint_map(&self) -> HashMap<Pubkey, Pubkey> {
-        let mut map = HashMap::new();
+    pub fn build_pool_state_to_mint_map(&self) -> FxHashMap<Pubkey, Pubkey> {
+        let mut map = FxHashMap::default();
+        // Iterate the 14 sub-vecs on each DiscoveredPools directly rather than calling
+        // all_pool_state_pubkeys(), which allocates a fresh Vec<Pubkey> per mint just
+        // to iterate it. With 200,000+ unique mints on mainnet that approach allocates
+        // and immediately drops 200,000 Vecs purely for iteration. Extending the map
+        // from each sub-vec avoids every one of those allocations.
         for (mint, pools) in &self.pools_by_mint {
-            for pubkey in pools.all_pool_state_pubkeys() {
-                map.insert(pubkey, *mint);
+            for pubkey in pools.raydium_v4.iter()
+                .chain(&pools.raydium_clmm)
+                .chain(&pools.raydium_cpmm)
+                .chain(&pools.meteora_damm)
+                .chain(&pools.meteora_dammv2)
+                .chain(&pools.meteora_dlmm)
+                .chain(&pools.whirlpool)
+                .chain(&pools.pump)
+                .chain(&pools.byreal)
+                .chain(&pools.pancakeswap)
+                .chain(&pools.humidifi)
+                .chain(&pools.vertigo)
+                .chain(&pools.heaven)
+                .chain(&pools.futarchy)
+            {
+                map.insert(*pubkey, *mint);
             }
         }
         map
@@ -170,6 +212,12 @@ fn is_quote_token(t: &Pubkey) -> bool {
 /// owned by that specific program rather than walking all 300M+ accounts on
 /// mainnet. RaydiumV4 which has ~1.4M owned accounts drops from 48 minutes
 /// to seconds.
+///
+/// # Blocking behaviour
+///
+/// This function performs synchronous bank reads (no async). If called from a
+/// Tokio async task it must be wrapped in `tokio::task::spawn_blocking` to avoid
+/// stalling the runtime thread for the duration of the multi-DEX scan.
 pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscoveryResult> {
     info!(
         "Starting pool discovery from bank at slot {} — querying 14 DEX programs",
@@ -206,7 +254,7 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     let heaven_program         = heaven_program_id();
     let futarchy_program       = futarchy_program_id();
 
-    let mut pools_by_mint: HashMap<Pubkey, DiscoveredPools> = HashMap::new();
+    let mut pools_by_mint: FxHashMap<Pubkey, DiscoveredPools> = FxHashMap::default();
     let mut found = 0usize;
     let start = std::time::Instant::now();
 

@@ -906,7 +906,33 @@ impl MevEngine {
         let blockhash = speculative_bank.last_blockhash();
         let mut events_sent: u32 = 0;
 
-        for (pool_address, account_data) in &update.accounts {
+        // Drain any graduation events that arrived for this batch BEFORE scanning
+        // the account map. The bridge sends graduation_tx before speculative_update_tx
+        // for the same entry batch, so every DetectedPool for this batch is already
+        // in graduation_rx by the time this update arrives here. The crossbeam select!
+        // loop may have dispatched the update_rx arm before the graduation_rx arm due
+        // to non-deterministic arm selection — this drain catches those in-flight
+        // graduation events before the per-account routing below checks pending_ready.
+        //
+        // Hoisting the drain here (once per batch) instead of inside the None arm of
+        // the account loop (once per untracked account per batch) eliminates O(n_untracked)
+        // try_recv syscalls on the hot path. The drain is bounded by the number of
+        // new-pool detections in the batch — typically zero.
+        while let Ok(g) = self.graduation_rx.try_recv() {
+            if !self.account_to_mint.contains_key(&g.pool_address) {
+                if self.pending_ready.len() < MAX_PENDING_READY {
+                    self.pending_ready.insert(g.pool_address, g);
+                }
+            }
+        }
+
+        // `_account_data` is intentionally unused in the event construction below.
+        // MevPoolUpdateEvent attaches the full speculative_bank rather than the
+        // individual account delta — the executor reads whichever accounts it needs
+        // directly from the bank via get_account() during simulation. The delta
+        // in update.accounts is used only for routing (which pool was touched) and
+        // for the accuracy snapshot, both of which use pool_address as the key.
+        for (pool_address, _account_data) in &update.accounts {
             match self.account_to_mint.get(pool_address) {
                 Some(mint) => {
                     let state = match self.mint_states.get(mint) {
@@ -939,36 +965,16 @@ impl MevEngine {
                 }
 
                 None => {
-                    // This account is not part of any currently registered mint.
-                    // Before checking pending_ready, drain any graduation events that
-                    // are already in graduation_rx but have not yet been processed by
-                    // the select! loop.
-                    //
-                    // The bridge sends graduation_tx BEFORE update_tx for the same
-                    // batch, so any DetectedPool for this batch is already in the
-                    // graduation_rx channel by the time this update arrives. However,
-                    // crossbeam_channel::select! is non-deterministic among ready arms
-                    // and may have picked update_rx first. Draining here ensures that
-                    // graduation events in-flight for this batch are absorbed into
-                    // pending_ready before we check it, so no new pool is ever missed
-                    // due to select! scheduling order.
-                    while let Ok(g) = self.graduation_rx.try_recv() {
-                        if !self.account_to_mint.contains_key(&g.pool_address) {
-                            if self.pending_ready.len() < MAX_PENDING_READY {
-                                self.pending_ready.insert(g.pool_address, g);
-                            }
-                        }
-                    }
-
-                    // If the account is now in pending_ready (either from the drain
-                    // above or from a prior graduation_rx select! arm dispatch),
-                    // Phase 2 fires: the pool is parsed and integrated into the graph.
+                    // The pre-loop graduation_rx drain (above) has already absorbed any
+                    // Phase 1 detections for this batch into pending_ready. Check here
+                    // whether this untracked account is a newly created pool address that
+                    // Phase 1 registered. If so, Phase 2 fires to integrate it into the
+                    // arb graph using the speculative bank that just executed the creation
+                    // transaction. Accounts that are neither tracked nor in pending_ready
+                    // belong to programs, sysvars, or other state the engine ignores.
                     if let Some(detected) = self.pending_ready.remove(pool_address) {
                         self.handle_pool_graduation(detected, &speculative_bank);
                     }
-                    // Accounts that are neither tracked nor newly graduated belong to
-                    // programs, sysvars, token accounts, or other on-chain state that
-                    // the engine has no interest in. They are silently skipped.
                 }
             }
         }

@@ -2137,20 +2137,36 @@ pub fn execute_entries_speculatively(
         }
     };
 
+    // The transaction-hash-verify pool (not replay_tx_thread_pool) is passed here
+    // for two reasons rooted in the fact that replay_tx_thread_pool is shared with
+    // canonical replay's process_entries, which runs concurrently on the same validator:
+    //
+    //   1. Thread isolation: validate_and_hash_transactions submits rayon tasks to the
+    //      provided pool. Using replay_tx_thread_pool here would allow speculative hash
+    //      verification work to steal rayon workers from canonical transaction execution,
+    //      introducing latency jitter into the canonical pipeline on every speculative batch.
+    //
+    //   2. Canonical parity: confirm_slot_entries (line ~1843) calls
+    //      validate_and_hash_transactions with transaction_hash_verify_thread_pool(),
+    //      not the replay pool. Using the same pool here keeps the speculative path
+    //      structurally identical to canonical replay for this phase.
+    //
+    // transaction_hash_verify_thread_pool() is a static OnceLock<ThreadPool> with
+    // TX_HASH_VERIFY_THREAD_POOL_SIZE (4) threads named "solReplayHash{i:02}",
+    // dedicated exclusively to hash verification and never used for SVM execution.
     let entry::ValidatedHashedTransactions {
         entries,
+        // Ed25519 batch verification is intentionally skipped: dropping this
+        // handle without calling .verify() is the mechanism by which the speculative
+        // path elides signature checking. Transactions with invalid signatures are
+        // executed speculatively; canonical replay subsequently detects them and marks
+        // the slot Dead. SpeculativeSlotExecutor::discard_slot() must then be called
+        // to evict the slot's results from the speculative cache.
         unverified_signatures: _,
-        // Ed25519 batch verification is intentionally skipped: dropping the
-        // unverified_signatures handle without calling .verify() is the mechanism
-        // by which the speculative execution path elides signature checking.
-        // Transactions with invalid signatures are executed speculatively; if
-        // the canonical path subsequently discovers them it marks the slot Dead,
-        // and SpeculativeSlotExecutor::discard_slot() must be called to evict
-        // the slot's results from the speculative cache.
     } = entry::validate_and_hash_transactions(
         entries,
         num_txs,
-        replay_tx_thread_pool,
+        transaction_hash_verify_thread_pool(),
         validate_and_hash_transaction,
     )?;
 
