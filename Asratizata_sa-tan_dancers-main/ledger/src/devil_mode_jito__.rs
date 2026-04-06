@@ -1159,13 +1159,12 @@ impl SpeculativeSlotExecutor {
         // goes through the rayon-based execution path inside process_entries,
         // matching canonical blockstore replay. The wrapper does not install a
         // scheduler — it is a zero-cost newtype for the duration of this call.
-        let batch_tx_count_executed = execute_entries_speculatively(
+        let exec_result = execute_entries_speculatively(
             &BankWithScheduler::new_without_scheduler(working_bank.clone()),
             &self.replay_tx_thread_pool,
             entries,
             tx_starting_index,
-        )
-        .map_err(SpeculativeExecutorError::Execution)?;
+        );
 
         // ---------------------------------------------------------------------
         // STATUS CACHE CONTAMINATION PREVENTION
@@ -1184,13 +1183,25 @@ impl SpeculativeSlotExecutor {
         // different accounts_lt_hash, and arrives at a different bank hash than
         // the leader produced. The validator marks the slot Dead.
         //
-        // clear_slot_signatures removes all entries for this slot's key from
-        // the shared cache. Calling it here, before the canonical replay thread
-        // ever acquires its read lock for this slot, erases every signature we
-        // wrote and restores the cache to exactly the state it would be in had
-        // speculative execution never run. The canonical path proceeds cleanly.
+        // This call MUST run unconditionally — before exec_result is inspected.
+        // process_entries calls execute_batch, which calls commit_transactions,
+        // which calls update_transaction_statuses and writes signatures into the
+        // shared cache BEFORE process_entries returns its error. Any entries that
+        // executed successfully before the failing entry have already written
+        // their signatures. If this call were placed after the ? operator, those
+        // signatures would remain in the cache on the error path, permanently
+        // contaminating it: every subsequent execution attempt for this slot —
+        // whether a retry here or canonical replay — sees AlreadyProcessed,
+        // which cascades into BlockhashNotFound as downstream banks inherit the
+        // broken state. Calling clear_slot_signatures here, before propagating
+        // the result, erases every signature this run wrote regardless of
+        // outcome and restores the cache to the state it was in before
+        // speculative execution touched it. The canonical path proceeds cleanly.
         // ---------------------------------------------------------------------
         working_bank.clear_slot_signatures(slot);
+
+        let batch_tx_count_executed = exec_result
+            .map_err(SpeculativeExecutorError::Execution)?;
 
         // ---------------------------------------------------------------------
         // Step 5: Persist the batch and advance the cumulative transaction count.
@@ -1641,12 +1652,27 @@ impl SpeculativeSlotExecutor {
                         // the same sequential transaction indexes as the original run,
                         // making the rebased result structurally identical to canonical
                         // replay output.
-                        let batch_count = match execute_entries_speculatively(
+                        let rebase_result = execute_entries_speculatively(
                             &BankWithScheduler::new_without_scheduler(new_bank.clone()),
                             &self.replay_tx_thread_pool,
                             entries,
                             batch_tx_starting_index,
-                        ) {
+                        );
+
+                        // Clear the status cache entries written by this rebased batch.
+                        // The rebased new_bank was forked from canonical_bank and
+                        // therefore shares its Arc<RwLock<BankStatusCache>>. This call
+                        // MUST run unconditionally — before rebase_result is inspected —
+                        // for the same reason as in execute(): commit_transactions writes
+                        // signatures into the shared cache before process_entries returns
+                        // its error. If this call were inside the Ok arm only, a partial
+                        // execution before the error would leave those signatures in the
+                        // cache, causing AlreadyProcessed for every future execution of
+                        // this child slot including canonical replay, which would compute
+                        // a wrong bank hash and mark the slot Dead.
+                        new_bank.clear_slot_signatures(child_slot);
+
+                        let batch_count = match rebase_result {
                             Ok(n) => n,
                             Err(e) => {
                                 child_error =
@@ -1654,17 +1680,6 @@ impl SpeculativeSlotExecutor {
                                 break;
                             }
                         };
-
-                        // Clear the status cache entries written by this rebased batch.
-                        // The rebased new_bank was forked from canonical_bank and
-                        // therefore shares its Arc<RwLock<BankStatusCache>>. Without
-                        // this call, every signature re-executed here remains in the
-                        // shared cache under child_slot's key. When the canonical replay
-                        // path later runs check_transactions for child_slot it finds them
-                        // as AlreadyProcessed, skips the transactions, computes a wrong
-                        // bank hash, and marks the slot Dead — the same contamination
-                        // described in execute() above.
-                        new_bank.clear_slot_signatures(child_slot);
 
                         // Accumulate locally — no lock acquired per batch.
                         accumulated_tx_count =
