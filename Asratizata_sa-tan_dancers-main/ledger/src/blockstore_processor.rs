@@ -2154,6 +2154,36 @@ pub fn execute_entries_speculatively(
     // transaction_hash_verify_thread_pool() is a static OnceLock<ThreadPool> with
     // TX_HASH_VERIFY_THREAD_POOL_SIZE (4) threads named "solReplayHash{i:02}",
     // dedicated exclusively to hash verification and never used for SVM execution.
+    // -------------------------------------------------------------------------
+    // Fix 1 — ALT resolution failures are soft errors in the speculative path.
+    //
+    // validate_and_hash_transactions calls bank.verify_transaction_with_serialized_message
+    // for each transaction, which resolves Address Lookup Table entries against the
+    // bank's accounts DB. In the Level-3 parent scenario (parent slot is in BankForks
+    // but not yet frozen — the normal shredstream-ahead-of-canonical case), the child
+    // bank was forked from a partially-executed parent whose final state is not yet
+    // committed. A transaction that creates an ALT in an earlier batch for this same
+    // slot would have failed that earlier batch via BlockhashNotFound (see Fix 2
+    // below). As a result, the ALT account does not yet exist in the speculative bank
+    // when this batch arrives.
+    //
+    // Propagating the error hard (the original `?`) causes the batch to be dropped
+    // entirely: the caller's `exec_result.map_err(...)? `propagates to the bridge,
+    // which logs a warning and discards the batch without storing it in
+    // pending_proto_batches. No rebase ever re-executes it, so the MEV engine
+    // never receives the correct speculative update for these transactions.
+    //
+    // Returning Ok(num_txs) instead stores the batch for rebase. During
+    // confirm_slot Phase 2 the batch is re-executed against the now-frozen
+    // canonical parent bank, where the ALT exists and the blockhash is registered.
+    // The re-execution succeeds and the correction update carries the accurate
+    // account delta to the engine.
+    //
+    // Invariant preserved: process_entries is never called when validate_and_hash
+    // fails, so no transactions are committed to the bank. The caller's unconditional
+    // clear_slot_signatures() call is a no-op. tx_count is advanced by num_txs, which
+    // is correct — the rebase must use the same slot-relative starting indexes.
+    // -------------------------------------------------------------------------
     let entry::ValidatedHashedTransactions {
         entries,
         // Ed25519 batch verification is intentionally skipped: dropping this
@@ -2163,12 +2193,20 @@ pub fn execute_entries_speculatively(
         // the slot Dead. SpeculativeSlotExecutor::discard_slot() must then be called
         // to evict the slot's results from the speculative cache.
         unverified_signatures: _,
-    } = entry::validate_and_hash_transactions(
+    } = match entry::validate_and_hash_transactions(
         entries,
         num_txs,
         transaction_hash_verify_thread_pool(),
         validate_and_hash_transaction,
-    )?;
+    ) {
+        Ok(v) => v,
+        // ALT resolution failure: the ALT may not exist in this speculative bank
+        // because its creating transaction was in a prior batch that failed due to
+        // the unfrozen Level-3 parent. Return Ok so the batch is stored and can be
+        // correctly re-executed during the confirm_slot rebase against the frozen
+        // canonical parent where the ALT is guaranteed to exist.
+        Err(_) => return Ok(num_txs),
+    };
 
     // -------------------------------------------------------------------------
     // Build ReplayEntry values by zipping sanitized entries with their
@@ -2237,7 +2275,44 @@ pub fn execute_entries_speculatively(
     //   that subsequently comes back Dead.
     // -------------------------------------------------------------------------
     let mut batch_timing = BatchExecutionTiming::default();
-    process_entries(
+    // -------------------------------------------------------------------------
+    // Fix 2 — Per-transaction errors are soft errors in the speculative path.
+    //
+    // The root cause: the speculative child bank was forked from a Level-3 parent
+    // (in BankForks but not yet frozen). The canonical freeze sequence is:
+    //
+    //   parent_bank.freeze()
+    //     └─ bank.update_slot_hashes()
+    //          └─ sysvar::slot_hashes::update(&bank, last_blockhash)
+    //               └─ blockhash_queue.register_hash(last_blockhash, ...)
+    //
+    // Because freeze() has NOT been called on the Level-3 parent at fork time,
+    // register_hash was never invoked for the parent's final blockhash. Any
+    // transaction in the child slot that references that blockhash hits
+    // check_transaction_for_nonce() → blockhash queue miss → BlockhashNotFound.
+    //
+    // In the canonical path this never happens because Bank::new_from_parent is
+    // always called AFTER the parent is frozen via bank.freeze() in
+    // process_replay_results (replay_stage.rs line 3530).
+    //
+    // Propagating the error hard causes the batch to be dropped, the bank to have
+    // partially committed state (some transactions ran before the failing one),
+    // and the MEV engine to receive nothing for this batch. With the fix applied:
+    //
+    //   · The caller's unconditional clear_slot_signatures() erases every signature
+    //     this batch wrote to the shared BankStatusCache before the error returned,
+    //     preventing AlreadyProcessed errors in canonical replay.
+    //   · Returning Ok(num_txs) stores the batch in pending_proto_batches.
+    //   · confirm_slot Phase 2 re-executes the batch against the now-frozen canonical
+    //     parent where the blockhash is registered — the transactions succeed.
+    //   · The correction update carries the correct account delta to the engine.
+    //
+    // The `other => return Err(other)` arm is unreachable in practice (only
+    // InvalidTransaction flows through this path) but is retained for defensive
+    // correctness — if a future code change introduces a new error class through
+    // process_entries it will be propagated rather than silently swallowed.
+    // -------------------------------------------------------------------------
+    match process_entries(
         bank,
         replay_tx_thread_pool,
         replay_entries,
@@ -2247,7 +2322,18 @@ pub fn execute_entries_speculatively(
         None, // log_messages_bytes_limit
         None, // prioritization_fee_cache
     )
-    .map_err(BlockstoreProcessorError::from)?;
+    .map_err(BlockstoreProcessorError::from)
+    {
+        Ok(()) => {}
+        // BlockhashNotFound (and any other per-transaction error): expected in the
+        // speculative path when the Level-3 parent's final blockhash is not yet
+        // registered. The stored batch will succeed during confirm_slot rebase
+        // against the frozen canonical parent. Soft-continue.
+        Err(BlockstoreProcessorError::InvalidTransaction(_)) => {}
+        // All other error classes (InvalidBlock, FailedToLoadEntries, etc.) are
+        // genuinely fatal and must propagate to the caller as hard errors.
+        Err(other) => return Err(other),
+    }
 
     Ok(num_txs)
 }
