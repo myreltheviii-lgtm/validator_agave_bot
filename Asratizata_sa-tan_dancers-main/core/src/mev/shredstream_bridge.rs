@@ -106,9 +106,13 @@ pub async fn run_speculative_executor(
     // No locks needed — all state transitions happen serially within this task.
     let mut detector = GraduationDetector::new();
 
-    // Clone the URL once here rather than on every iteration of the reconnect
-    // loop.  Cloning a String allocates — doing it per-loop-iteration on a
-    // background reconnect path is harmless in absolute terms but wasteful.
+    // The URL is an owned String moved in from the caller. Each reconnect
+    // attempt clones it once to pass ownership to tonic's connect function,
+    // which requires a String or value that can be converted to an Endpoint.
+    // Reconnects are rare — they occur only when the gRPC stream to the
+    // shredstream proxy fails, typically seconds apart. Cloning a short URL
+    // string on a path that fires at most once every few seconds is negligible.
+    // This is NOT the hot path; the hot path is the entry-processing loop below.
     let url = shredstream_url;
 
     // Pre-allocate a scratch buffer for resolving instruction account indices
@@ -129,6 +133,8 @@ pub async fn run_speculative_executor(
         }
 
         // Attempt to open a gRPC channel to the shredstream proxy.
+        // url.clone() allocates once per reconnect — acceptable given reconnects
+        // are rare (seconds apart) and this is not the entry-processing hot path.
         let mut client: ShredstreamProxyClient<tonic::transport::Channel> =
             match ShredstreamProxyClient::connect(url.clone()).await {
                 Ok(c) => {
@@ -273,12 +279,16 @@ pub async fn run_speculative_executor(
             // (one iteration, no rebasing) this saves one Vec<u8> clone per batch.
             // Entry bytes can be many kilobytes; the saving is real on the hot path.
             //
-            // The one unavoidable clone is entry.entries → Arc::new(...), because
-            // spawn_blocking requires 'static ownership and entry is borrowed from
-            // the gRPC stream; we cannot move out of it without consuming the message.
+            // entry.entries is MOVED directly into Arc::new rather than cloned.
+            // entry is the owned value from `while let Ok(Some(entry)) = stream.message()`.
+            // The only borrow of entry.entries was inside the graduation-detection block
+            // above (lines 199-258); that borrow ended at the closing brace of that block.
+            // By this point entry.entries is available for an unconditional move.
+            // entry.slot and entry.parent_slot are u64 (Copy), so extracting them first
+            // does not partially move the struct and the subsequent field move compiles.
             let entry_slot = entry.slot;
             let entry_parent_slot = entry.parent_slot;
-            let entry_bytes: Arc<Vec<u8>> = Arc::new(entry.entries.clone());
+            let entry_bytes: Arc<Vec<u8>> = Arc::new(entry.entries);
             // Arc clone of the accounts Vec — one atomic increment, no heap allocation.
             let accounts_vec: Arc<Vec<Pubkey>> = accounts_guard.clone();
 

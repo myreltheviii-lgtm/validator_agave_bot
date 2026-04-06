@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use solana_clock::Slot;
 use solana_pubkey::Pubkey;
@@ -616,23 +616,34 @@ pub struct GraduationDetector {
     /// Raydium CLMM pools created but awaiting increase_liquidity_v2.
     /// Capped at MAX_PENDING_CLMM.  Only CLMM creation instructions write to
     /// this map — DLMM and Whirlpool spam cannot fill it.
-    pending_clmm: HashMap<Pubkey, PendingConcentratedPool>,
+    pending_clmm: FxHashMap<Pubkey, PendingConcentratedPool>,
 
     /// Orca Whirlpool pools created but awaiting increase_liquidity.
     /// Capped at MAX_PENDING_WHIRLPOOL.
-    pending_whirlpool: HashMap<Pubkey, PendingConcentratedPool>,
+    pending_whirlpool: FxHashMap<Pubkey, PendingConcentratedPool>,
 
     /// Meteora DLMM lb_pairs created but awaiting add_liquidity.
     /// Capped at MAX_PENDING_DLMM.
-    pending_dlmm: HashMap<Pubkey, PendingConcentratedPool>,
+    pending_dlmm: FxHashMap<Pubkey, PendingConcentratedPool>,
 }
 
 impl GraduationDetector {
     pub fn new() -> Self {
+        // Pre-allocate each pending map to 256 slots. On mainnet, the typical
+        // number of in-flight concentrated-liquidity pool creations awaiting
+        // their first liquidity deposit is well below 256 even during busy
+        // periods. Pre-allocating avoids the first several rehash-and-grow
+        // cycles that would otherwise fire as the first pools are inserted.
+        let mut pending_clmm = FxHashMap::default();
+        pending_clmm.reserve(256);
+        let mut pending_whirlpool = FxHashMap::default();
+        pending_whirlpool.reserve(256);
+        let mut pending_dlmm = FxHashMap::default();
+        pending_dlmm.reserve(256);
         Self {
-            pending_clmm: HashMap::with_capacity(256),
-            pending_whirlpool: HashMap::with_capacity(256),
-            pending_dlmm: HashMap::with_capacity(256),
+            pending_clmm,
+            pending_whirlpool,
+            pending_dlmm,
         }
     }
 

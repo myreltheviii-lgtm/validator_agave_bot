@@ -680,13 +680,31 @@ pub fn discover_all_pools_grouped_by_mint(bank: &Arc<Bank>) -> Result<MintDiscov
     );
 
     info!("Top 10 mints by pool count:");
-    let mut mint_pool_counts: Vec<(Pubkey, usize)> = pools_by_mint
-        .iter()
-        .map(|(mint, pools)| (*mint, pools.total_count()))
-        .collect();
-    mint_pool_counts.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for (rank, (mint, count)) in mint_pool_counts.iter().take(10).enumerate() {
+    // A single O(n) pass with a fixed-size buffer of 11 slots avoids allocating
+    // and sorting the entire mint map (potentially millions of entries) just to
+    // log 10 lines. At each step the buffer is capped at 10 by removing the
+    // current minimum whenever the buffer grows to 11 entries. A final sort of
+    // the 10-entry buffer is O(10 log 10) ≈ O(1) — negligible.
+    let mut top10: Vec<(Pubkey, usize)> = Vec::with_capacity(11);
+    for (mint, pools) in &pools_by_mint {
+        let count = pools.total_count();
+        top10.push((*mint, count));
+        if top10.len() > 10 {
+            // Find and remove the entry with the smallest count, keeping only
+            // the 10 highest-count mints seen so far. swap_remove is O(1) —
+            // it swaps the target with the last element and pops; order is
+            // restored by the sort after the loop.
+            let min_idx = top10
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            top10.swap_remove(min_idx);
+        }
+    }
+    top10.sort_by(|a, b| b.1.cmp(&a.1));
+    for (rank, (mint, count)) in top10.iter().enumerate() {
         info!("  {}. {}: {} pools", rank + 1, mint, count);
     }
 

@@ -215,7 +215,7 @@ impl ArbitrageExecutor {
                         continue;
                     }
 
-                    info!(
+                    tracing::debug!(
                         "ArbitrageExecutor[{}]: pool {} affects {} qualifying pair(s) \
                          (from_speculative={})",
                         mint,
@@ -340,12 +340,20 @@ impl ArbitrageExecutor {
         let sim_bank: Arc<Bank> = match &event.speculative_bank {
             Some(bank) => Arc::clone(bank),
             None => {
-                let guard = self
+                // Acquire the read lock, clone the Arc immediately, and release
+                // the lock before any further work. The lock is held for exactly
+                // one Arc::clone — an atomic refcount increment. Keeping the
+                // guard alive longer than necessary would block any concurrent
+                // engine write that tries to update canonical_bank.
+                let maybe_bank: Option<Arc<Bank>> = self
                     .canonical_bank
                     .read()
-                    .map_err(|_| anyhow!("canonical_bank RwLock poisoned"))?;
-                match guard.as_ref() {
-                    Some(bank) => Arc::clone(bank),
+                    .map_err(|_| anyhow!("canonical_bank RwLock poisoned"))?
+                    .as_ref()
+                    .map(Arc::clone);
+                // Read lock is released here — the guard has been dropped.
+                match maybe_bank {
+                    Some(bank) => bank,
                     None => {
                         // The canonical bank is None only during the brief startup
                         // window before replay has frozen the first block. Return

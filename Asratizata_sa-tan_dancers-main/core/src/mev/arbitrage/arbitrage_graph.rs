@@ -556,7 +556,7 @@ impl ArbitrageGraph {
             });
         }
 
-        info!("Total pools collected for graph building: {}", all_pools.len());
+        tracing::debug!("Total pools collected for graph building: {}", all_pools.len());
 
         // Build the token-pair index and known-address deduplication set in a single
         // pass. The canonical key sorts the two mint pubkeys so (A, B) and (B, A)
