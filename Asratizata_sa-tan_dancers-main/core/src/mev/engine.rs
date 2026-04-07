@@ -615,6 +615,12 @@ impl MevEngine {
     /// batch and is immediately usable for simulation — no further waiting for slot
     /// completion or `bank.freeze()`.
     ///
+    /// The bank reference is the same `Arc<Bank>` that `execute_batch` was
+    /// operating on.  Because the Arc was cloned into the payload at commit time,
+    /// the bank is guaranteed to still be alive regardless of how quickly
+    /// BankForks evicts the slot — the Arc itself keeps the allocation alive
+    /// until the engine drops the batch.
+    ///
     /// For every account that was touched by a committed transaction and that maps
     /// to a tracked mint, a `MevPoolUpdateEvent` is broadcast to that mint's
     /// `ArbitrageExecutor`.  The event carries the exact bank reference so the

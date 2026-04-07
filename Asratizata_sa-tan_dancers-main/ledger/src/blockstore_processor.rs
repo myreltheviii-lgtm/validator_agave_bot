@@ -111,10 +111,27 @@ struct ReplayEntry {
 /// The bank has already committed all changes reflected in `commit_results` by
 /// the time this payload is constructed — account state, lamport balances, and
 /// program logs are live in the bank and can be queried immediately.
+///
+/// Carrying `Arc<Bank>` extends the bank's reference count by one for the
+/// lifetime of this message in the channel.  That is intentional: it pins the
+/// exact bank the MEV engine needs for simulation, guaranteeing that the engine
+/// can call `simulate_transaction_unchecked` against committed account state
+/// without racing against BankForks cleanup.  The overhead is a single atomic
+/// ref-count increment at payload construction and a matching decrement when
+/// the engine drops the batch — negligible compared with the slot interval.
 #[derive(Debug)]
 pub struct MevExecutedBatch {
     /// Slot that owns the bank in which these transactions were committed.
+    /// Redundant with `bank.slot()` but kept as a plain `u64` copy so that
+    /// routing logic in the engine can read the slot without acquiring the
+    /// bank's internal locks.
     pub slot: Slot,
+    /// The unfrozen canonical bank at the moment of commit.  All writes from
+    /// every `Ok` result in `commit_results` are live here; the engine can
+    /// read any account or call `simulate_transaction_unchecked` immediately.
+    /// The bank is still open (not yet frozen) — subsequent batches in the
+    /// same slot will add further writes before `bank.freeze()` is called.
+    pub bank: Arc<Bank>,
     /// One commit result per transaction in `transactions`, in the same order.
     /// `Ok(committed)` means the transaction executed and its side-effects are
     /// now in the bank; `Err(e)` means it was rejected before or during SVM
@@ -323,6 +340,7 @@ pub fn execute_batch<'a>(
             .collect();
         let _ = sender.try_send(MevExecutedBatch {
             slot: bank.slot(),
+            bank: Arc::clone(bank),
             commit_results: commit_results.clone(),
             transactions,
         });

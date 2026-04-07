@@ -145,14 +145,20 @@ pub async fn run_graduation_bridge(
 
             // Phase 1: scan this entry batch for pool-creation instructions.
             //
-            // bincode is the standard Solana serialization codec for Entry.
-            // The shredstream proxy reassembles shreds into entry bytes using
-            // the same bincode encoding that the blockstore uses internally.
-            // Deserialization is best-effort — a failure silently skips
-            // graduation scanning for this batch and lets the canonical pipeline
-            // handle confirmation normally.  No entry bytes are cloned: the
-            // reference `&entry.entries` is valid for the duration of this scope.
-            if let Ok(parsed_entries) = bincode::deserialize::<Vec<Entry>>(&entry.entries) {
+            // Agave's validator replaced the serde/bincode serialization contract
+            // for Entry with wincode — a purpose-built codec that owns the
+            // canonical wire format for validator-internal types.  Entry only
+            // implements wincode::Deserialize, not serde::Deserialize, so bincode
+            // cannot be used here.  The shredstream proxy reassembles shreds into
+            // entry bytes using the same wincode encoding that the blockstore uses
+            // internally, making wincode::deserialize the correct and only valid
+            // deserialization path.
+            //
+            // Deserialization is best-effort — a failure silently skips graduation
+            // scanning for this batch and lets the canonical pipeline handle
+            // confirmation normally.  No entry bytes are cloned: the reference
+            // `&entry.entries` is valid for the duration of this scope.
+            if let Ok(parsed_entries) = wincode::deserialize::<Vec<Entry>>(&entry.entries) {
                 for parsed_entry in &parsed_entries {
                     for tx in &parsed_entry.transactions {
                         let message = &tx.message;
