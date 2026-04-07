@@ -22,6 +22,11 @@ use {
         versioned::VersionedTransaction,
     },
     std::{
+        // RwLock is used for the arb_graph field which is shared with the engine's
+        // graduation handler.  The engine holds the write lock only during add_pool
+        // (rare — one per new pool graduation); the executor holds the read lock for
+        // the brief per-event window covering address lookup, pair index iteration,
+        // and path clone.  No lock is ever held across an await point.
         sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
@@ -78,13 +83,6 @@ pub struct ArbitrageExecutor {
     /// since their Guard is dropped before any await point. The engine calls `store()`
     /// only on graduation events (rare).
     pub(crate) pool_data: Arc<ArcSwap<MintPoolData>>,
-    /// The most recently frozen canonical bank, updated by MevEngine on every
-    /// `BankNotification::Frozen` event.  Simulation tasks prefer the speculative
-    /// bank embedded in the pool-update event; they fall back to this value only
-    /// when no speculative bank is present (e.g. during the brief startup window
-    /// before the first shredstream entry arrives or when the speculative bank for
-    /// the triggering slot has already been confirmed and removed).
-    pub(crate) canonical_bank: Arc<RwLock<Option<Arc<Bank>>>>,
     pub(crate) wallet: Arc<Keypair>,
     pub(crate) lut_manager: Arc<LutManager>,
     pub(crate) rpc_client: Arc<solana_client::rpc_client::RpcClient>,
@@ -107,7 +105,6 @@ impl ArbitrageExecutor {
     pub fn new(
         arb_graph: Arc<RwLock<ArbitrageGraph>>,
         pool_data: Arc<ArcSwap<MintPoolData>>,
-        canonical_bank: Arc<RwLock<Option<Arc<Bank>>>>,
         wallet: Arc<Keypair>,
         lut_manager: Arc<LutManager>,
         rpc_client: Arc<solana_client::rpc_client::RpcClient>,
@@ -118,7 +115,6 @@ impl ArbitrageExecutor {
         Self {
             arb_graph,
             pool_data,
-            canonical_bank,
             wallet,
             lut_manager,
             rpc_client,
@@ -215,13 +211,11 @@ impl ArbitrageExecutor {
                         continue;
                     }
 
-                    tracing::debug!(
-                        "ArbitrageExecutor[{}]: pool {} affects {} qualifying pair(s) \
-                         (from_speculative={})",
+                    info!(
+                        "ArbitrageExecutor[{}]: pool {} affects {} qualifying pair(s)",
                         mint,
                         pool_address,
                         qualifying_pairs.len(),
-                        event.from_speculative_execution,
                     );
 
                     let event = Arc::new(event);
@@ -307,9 +301,15 @@ impl ArbitrageExecutor {
     /// trade between simulation and landing, the program reverts cleanly rather
     /// than landing as a net loss.
     ///
-    /// Bank selection priority: speculative bank (from shredstream, reflects
-    /// post-entry account state before canonical confirmation) > canonical bank
-    /// (most recently frozen, reflects state as of the last confirmed block).
+    /// ## Bank
+    ///
+    /// The bank arrives in `event.bank`, already carrying all committed writes
+    /// from the batch that triggered this event.  `execute_batch()` in
+    /// `blockstore_processor.rs` clones `Arc<Bank>` into every `MevExecutedBatch`
+    /// immediately after the SVM commit returns — mid-slot, before `bank.freeze()`
+    /// is called.  `simulate_transaction_unchecked` does not require a frozen bank,
+    /// so simulation against an in-progress canonical bank is safe and gives the
+    /// most current possible pool state.
     async fn try_execute_arbitrage(
         &self,
         path: &ArbitragePath,
@@ -332,37 +332,14 @@ impl ArbitrageExecutor {
         // it — no more, no less — while allowing the epoch to advance freely.
         let pool_data: Arc<MintPoolData> = self.pool_data.load_full();
 
-        // Resolve the simulation bank.  The speculative bank holds the write-set
-        // of entries that have been executed speculatively but not yet confirmed
-        // by the canonical replay pipeline — it reflects account state further
-        // ahead in time than the canonical bank, giving the engine an edge over
-        // bots that only have access to the last confirmed block.
-        let sim_bank: Arc<Bank> = match &event.speculative_bank {
-            Some(bank) => Arc::clone(bank),
-            None => {
-                // Acquire the read lock, clone the Arc immediately, and release
-                // the lock before any further work. The lock is held for exactly
-                // one Arc::clone — an atomic refcount increment. Keeping the
-                // guard alive longer than necessary would block any concurrent
-                // engine write that tries to update canonical_bank.
-                let maybe_bank: Option<Arc<Bank>> = self
-                    .canonical_bank
-                    .read()
-                    .map_err(|_| anyhow!("canonical_bank RwLock poisoned"))?
-                    .as_ref()
-                    .map(Arc::clone);
-                // Read lock is released here — the guard has been dropped.
-                match maybe_bank {
-                    Some(bank) => bank,
-                    None => {
-                        // The canonical bank is None only during the brief startup
-                        // window before replay has frozen the first block. Return
-                        // without error — subsequent events will have a bank.
-                        return Ok(());
-                    }
-                }
-            }
-        };
+        // The bank arrives directly in the event, already committed.
+        // `execute_batch()` in blockstore_processor clones `Arc<Bank>` into every
+        // `MevExecutedBatch` the moment the SVM commit returns — mid-slot, before
+        // `bank.freeze()` is called.  All account writes from every `Ok` commit result
+        // in this batch are already live in this bank.  `simulate_transaction_unchecked`
+        // does not require a frozen bank, so simulation against an in-progress canonical
+        // bank is safe and gives the most current possible pool state.
+        let sim_bank: Arc<Bank> = Arc::clone(&event.bank);
 
         // Validate the token-flow path and build the initial SMB instruction.
         let token_flow = TokenFlowValidator::validate_and_build_flow(path)?;
@@ -420,7 +397,7 @@ impl ArbitrageExecutor {
         .map_err(|e| anyhow!("transaction sanitization failed for pair {}: {:?}", pair_idx, e))?;
 
         // `simulate_transaction_unchecked` does NOT assert `bank.is_frozen()` so it
-        // is safe to call on an active (non-frozen) speculative bank.  It runs the
+        // is safe to call on an active (non-frozen) canonical bank.  It runs the
         // full SVM execution stack in memory, discards all write-set mutations, and
         // returns the result, units consumed, and fee.
         //
@@ -454,14 +431,12 @@ impl ArbitrageExecutor {
             // The permit is released before any I/O occurs, consistent with the
             // design principle that it gates CPU simulation, not logging or submission.
             info!(
-                "[VALIDATION] pair={} mint={} latency={}µs units={} fee={:?} \
-                 from_speculative={}",
+                "[VALIDATION] pair={} mint={} latency={}µs units={} fee={:?}",
                 pair_idx,
                 pool_data.mint,
                 latency_us,
                 sim_result.units_consumed,
                 sim_result.fee,
-                event.from_speculative_execution,
             );
             return Ok(());
         }

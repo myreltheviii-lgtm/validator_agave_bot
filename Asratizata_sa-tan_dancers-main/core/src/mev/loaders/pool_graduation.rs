@@ -17,48 +17,46 @@ use crate::mev::dex::whirlpool::constants::whirlpool_program_id;
 // between them.  The design achieves this by assigning each phase to exactly
 // one thread:
 //
-//   Phase 1 — detect_instruction (bridge thread only)
+//   Phase 1 — detect_instruction (bridge task only)
 //     The shredstream bridge calls this for every instruction in every entry
-//     batch.  At this point the transaction has NOT been applied to any bank —
-//     bank.get_account() would return None for any account the transaction
-//     intends to write.  Phase 1 does zero bank access.  It inspects raw
-//     instruction bytes, extracts pool addresses and mints, and returns
-//     Option<DetectedPool> when a pool is ready.
+//     batch received from the Jito shredstream proxy.  At this point the
+//     transaction has NOT been applied to any bank — bank.get_account() would
+//     return None for any account the transaction intends to write.  Phase 1
+//     does zero bank access.  It inspects raw instruction bytes, extracts pool
+//     addresses and mints, and returns Option<DetectedPool> when a pool is
+//     ready for Phase 2.  The DetectedPool is sent over a crossbeam channel
+//     (graduation_tx) to the engine.
 //
-//   Phase 2 — caller's responsibility (engine thread only)
-//     The bridge sends DetectedPool over a crossbeam channel to the engine.
-//     The engine stores it in a pending_ready map keyed by pool_address.
-//     When a SpeculativeAccountUpdate arrives for that pubkey, the speculative
-//     executor has already applied the transaction to the bank, so the account
-//     exists in the speculative write cache. The engine parses it using the
-//     GraduationSource discriminant to select the correct DEX parser, then
-//     injects the pool into the running ArbitrageGraph.
+//   Phase 2 — engine thread only
+//     The engine receives DetectedPool values from graduation_rx and stores
+//     them in pending_ready, keyed by pool_address.  When a MevExecutedBatch
+//     arrives from blockstore_processor::execute_batch() whose committed
+//     transactions include the detected pool address, the creation is confirmed:
+//     the engine parses the pool account from the batch's bank, constructs the
+//     arb-graph entries, and registers the pool with the running
+//     ArbitrageExecutor for that mint.  The frozen-bank path (handle_frozen_bank)
+//     provides an additional Phase 2 trigger for pools whose creation transaction
+//     was the last committed batch of the slot.
 //
 // Because GraduationDetector is owned exclusively by the bridge task, no
 // Mutex or Arc is needed.  The crossbeam channel connecting Phase 1 output
 // to Phase 2 processing is the only cross-thread communication, and crossbeam
 // channels are already lock-free and safe for concurrent send/recv.
 //
-// Race condition between graduation_tx and update_tx
-//   For any DEX, Phase 1 fires (graduation_tx.send) before executor.execute()
-//   runs on the same batch, and execute() produces the update_tx.send.  So by
-//   the time the engine's update_rx receives a message, the corresponding
-//   graduation event is already in graduation_rx.
-//
-//   However, crossbeam_channel::select! is non-deterministic among ready arms.
-//   Even though graduation was sent before the update, select! may pick update_rx
-//   first.  The engine handles this by draining graduation_rx with try_recv() in
-//   the None arm of handle_speculative_update — the arm that fires when an account
-//   is not yet tracked.  This drain runs before checking pending_ready, so even
-//   in the race case the DetectedPool is absorbed from the channel and the new
-//   pool is registered within the same handle_speculative_update call.
+// Race condition between graduation_tx and mev_batch_rx
+//   For any DEX, Phase 1 fires (graduation_tx.send) before the corresponding
+//   MevExecutedBatch arrives at the engine.  However, crossbeam_channel::select!
+//   is non-deterministic among ready arms.  The engine handles this by draining
+//   graduation_rx with try_recv() at the start AND end of handle_mev_batch.
+//   Even if select! dispatches mev_batch_rx before graduation_rx, the DetectedPool
+//   is absorbed within the same handle_mev_batch call.
 //
 // Stale entry management
-//   For single-event DEXes, Phase 1 fires before the transaction executes.
-//   If the transaction fails, no SpeculativeAccountUpdate arrives for the pool
-//   address and the engine's pending_ready entry remains. The engine's
+//   If a pool-creation transaction fails or lands in a slot that canonical replay
+//   later declares dead, no MevExecutedBatch confirms the creation.  The engine's
 //   dead_slot_rx handler sweeps pending_ready for all entries belonging to the
-//   dead slot, using the `slot` field on DetectedPool. This bounds stale
+//   dead slot, using the `slot` field on DetectedPool.  The bridge mirrors this
+//   via clear_dead_slot on its per-DEX pending maps.  This bounds stale
 //   accumulation to at most one slot's worth of unconfirmed pool creations.
 // ---------------------------------------------------------------------------
 
@@ -475,18 +473,23 @@ const MAX_PENDING_DLMM: usize = 1024;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// The output of Phase 1.  When detect_instruction returns Some(DetectedPool),
-/// the bridge sends this over its crossbeam channel to the engine.
+/// The output of Phase 1.  When `detect_instruction` returns `Some(DetectedPool)`,
+/// the bridge sends this value over `graduation_tx` to `MevEngine`.
 ///
-/// The engine stores it in a HashMap<Pubkey, DetectedPool> keyed by pool_address
-/// (pending_ready).  When a SpeculativeAccountUpdate arrives for that pubkey,
-/// the engine invokes the appropriate pool parser and injects the pool into the
-/// running ArbitrageGraph for the matching mint.
+/// The engine stores it in `pending_ready`, a `FxHashMap<Pubkey, DetectedPool>`
+/// keyed by `pool_address`.  When a `MevExecutedBatch` arrives from
+/// `blockstore_processor::execute_batch()` whose committed transactions include
+/// `pool_address` among their account keys, Phase 2 fires: the engine calls
+/// `bank.get_account(pool_address)` on the batch's bank, deserialises the freshly
+/// written pool state, and injects the pool into the running `ArbitrageGraph`
+/// for the matching mint.  The frozen-bank handler (`handle_frozen_bank`) provides
+/// an additional Phase 2 trigger at slot completion for any pool whose creation
+/// was the last committed batch of the slot.
 ///
-/// `slot` allows the engine's dead_slot_rx handler to sweep pending_ready when
+/// `slot` allows the engine's `dead_slot_rx` handler to sweep `pending_ready` when
 /// a slot is declared dead by canonical replay.  Without the slot field, stale
 /// entries from transactions that failed within a dead slot would remain in
-/// pending_ready indefinitely, bounded only by the DEX-specific pending map caps.
+/// `pending_ready` indefinitely, bounded only by the DEX-specific pending map caps.
 #[derive(Debug, Clone)]
 pub struct DetectedPool {
     /// On-chain address of the newly created pool.
@@ -616,6 +619,10 @@ pub struct GraduationDetector {
     /// Raydium CLMM pools created but awaiting increase_liquidity_v2.
     /// Capped at MAX_PENDING_CLMM.  Only CLMM creation instructions write to
     /// this map — DLMM and Whirlpool spam cannot fill it.
+    ///
+    /// FxHashMap is used because all keys are 32-byte Pubkeys; SipHash's
+    /// collision resistance adds no security value here while costing 4–6×
+    /// the CPU time of FxHash's identity-style mixing.
     pending_clmm: FxHashMap<Pubkey, PendingConcentratedPool>,
 
     /// Orca Whirlpool pools created but awaiting increase_liquidity.
@@ -629,21 +636,10 @@ pub struct GraduationDetector {
 
 impl GraduationDetector {
     pub fn new() -> Self {
-        // Pre-allocate each pending map to 256 slots. On mainnet, the typical
-        // number of in-flight concentrated-liquidity pool creations awaiting
-        // their first liquidity deposit is well below 256 even during busy
-        // periods. Pre-allocating avoids the first several rehash-and-grow
-        // cycles that would otherwise fire as the first pools are inserted.
-        let mut pending_clmm = FxHashMap::default();
-        pending_clmm.reserve(256);
-        let mut pending_whirlpool = FxHashMap::default();
-        pending_whirlpool.reserve(256);
-        let mut pending_dlmm = FxHashMap::default();
-        pending_dlmm.reserve(256);
         Self {
-            pending_clmm,
-            pending_whirlpool,
-            pending_dlmm,
+            pending_clmm: FxHashMap::default(),
+            pending_whirlpool: FxHashMap::default(),
+            pending_dlmm: FxHashMap::default(),
         }
     }
 
@@ -922,10 +918,11 @@ impl GraduationDetector {
     //
     // Each method moves a pool from its specific pending map to a DetectedPool
     // when the DEX's liquidity gate instruction fires.  If the pool address is
-    // not in the map, this is a deposit on an established pool — return None
-    // silently and let it travel the normal SpeculativeAccountUpdate path.
+    // not in the map, this instruction is a deposit on an already-established
+    // pool — return None silently.  The engine will route any resulting account
+    // update through its normal MevExecutedBatch handling path.
     //
-    // A single generic `promote_from(&mut self, map: &mut HashMap<...>)` would
+    // A single generic `promote_from(&mut self, map: &mut FxHashMap<...>)` would
     // require simultaneously holding `&mut self` (method receiver) and
     // `&mut self.pending_xxx` (the map argument).  These are overlapping mutable
     // borrows of the same allocation — a compile error in Rust regardless of
@@ -964,7 +961,7 @@ impl GraduationDetector {
     /// Called by the shredstream bridge task when it receives a `dead_slot` value
     /// from the engine's `mev_dead_slot_sender` channel clone.
     pub fn clear_dead_slot(&mut self, dead_slot: Slot) {
-        // `HashMap::retain` iterates the map once and removes matching entries in-place.
+        // `retain` iterates the map once and removes matching entries in-place.
         // Each call is O(n) in the map size, which is bounded by the per-DEX cap.
         self.pending_clmm.retain(|_, entry| entry.slot != dead_slot);
         self.pending_whirlpool.retain(|_, entry| entry.slot != dead_slot);

@@ -19,7 +19,6 @@ pub mod blockstore_metric_report_service;
 pub mod blockstore_metrics;
 pub mod blockstore_options;
 pub mod blockstore_processor;
-pub mod devil_mode_jito__;
 pub mod entry_notifier_interface;
 pub mod entry_notifier_service;
 pub mod genesis_utils;

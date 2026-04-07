@@ -98,6 +98,39 @@ struct ReplayEntry {
     starting_index: usize,
 }
 
+/// Payload delivered to the MEV engine the instant a transaction batch commits
+/// to the bank, mid-slot, before the slot is complete and before `bank.freeze()`
+/// is ever called.
+///
+/// Every `execute_batch()` invocation produces exactly one of these.  Because
+/// `execute_batches_internal()` runs batches in parallel across rayon threads,
+/// multiple `MevExecutedBatch` messages may be in-flight simultaneously for the
+/// same slot; the MEV engine must be prepared to receive them out of
+/// chronological order within a slot.
+///
+/// The bank has already committed all changes reflected in `commit_results` by
+/// the time this payload is constructed — account state, lamport balances, and
+/// program logs are live in the bank and can be queried immediately.
+#[derive(Debug)]
+pub struct MevExecutedBatch {
+    /// Slot that owns the bank in which these transactions were committed.
+    pub slot: Slot,
+    /// One commit result per transaction in `transactions`, in the same order.
+    /// `Ok(committed)` means the transaction executed and its side-effects are
+    /// now in the bank; `Err(e)` means it was rejected before or during SVM
+    /// execution and nothing was written.
+    pub commit_results: Vec<TransactionCommitResult>,
+    /// The sanitized (hash-validated) transactions that were submitted to SVM
+    /// in this batch.  Parallel to `commit_results`.
+    pub transactions: Vec<SanitizedTransaction>,
+}
+
+/// Sender half of the MEV hook channel.  Passed as `Option<&MevBatchSender>`
+/// through every layer from `confirm_slot()` down to `execute_batch()`.
+/// Using `Option` keeps all call-sites that do not need the hook (startup
+/// ledger replay, tests) zero-cost — they simply pass `None`.
+pub type MevBatchSender = crossbeam_channel::Sender<MevExecutedBatch>;
+
 fn first_err(results: &[Result<()>]) -> Result<()> {
     for r in results {
         if r.is_err() {
@@ -185,6 +218,13 @@ pub fn execute_batch<'a>(
     extra_pre_commit_callback: Option<
         impl FnOnce(&Result<ProcessedTransaction>) -> Result<Option<usize>>,
     >,
+    // Fires the instant this batch commits to the bank, mid-slot, before
+    // `bank.freeze()`.  The MEV engine receives committed account state
+    // changes ~200-400 ms earlier than the Geyser "processed" commitment
+    // level, which is gated behind full slot completion.  `try_send` is used
+    // deliberately: if the MEV engine's consumer thread is behind the replay
+    // thread, the signal is dropped rather than stalling block replay.
+    mev_batch_sender: Option<&'a MevBatchSender>,
 ) -> Result<()> {
     let TransactionBatchWithIndexes {
         batch,
@@ -257,6 +297,37 @@ pub fn execute_batch<'a>(
             log_messages_bytes_limit,
             pre_commit_callback,
         )?;
+
+    // ─── MEV HOOK ────────────────────────────────────────────────────────────
+    // Bank state has been committed by `load_execute_and_commit_transactions…`
+    // above.  Every account write, lamport transfer, and program log from this
+    // batch is now live in the bank and can be read by any thread holding an
+    // `Arc<Bank>` reference.
+    //
+    // This fires mid-slot — the slot is NOT complete and `bank.freeze()` has
+    // NOT been called.  The MEV engine must tolerate the fact that subsequent
+    // batches in the same slot (or even a slot that ultimately gets marked dead
+    // by PoH verification) may follow.  Speculative reads against an unfrozen
+    // bank are always safe; writes are never performed here.
+    //
+    // `try_send` intentionally drops the payload if the channel's bounded
+    // buffer is full.  Stalling the replay thread to wait for the MEV consumer
+    // would introduce back-pressure into the critical block-replay path, which
+    // is strictly unacceptable.  A dropped signal is tolerable; a delayed slot
+    // confirmation is not.
+    if let Some(sender) = mev_batch_sender {
+        let transactions = batch
+            .sanitized_transactions()
+            .iter()
+            .map(|tx| tx.as_sanitized_transaction().into_owned())
+            .collect();
+        let _ = sender.try_send(MevExecutedBatch {
+            slot: bank.slot(),
+            commit_results: commit_results.clone(),
+            transactions,
+        });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
     let tx_costs = if block_verification {
@@ -408,6 +479,10 @@ fn execute_batches_internal(
     replay_vote_sender: Option<&ReplayVoteSender>,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    // Forwarded unchanged to every `execute_batch()` call in the rayon pool.
+    // Multiple parallel rayon tasks may fire this sender concurrently; the
+    // channel and `MevExecutedBatch` are both `Send` so this is safe.
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> Result<ExecuteBatchesInternalMetrics> {
     assert!(!batches.is_empty());
     let execution_timings_per_thread: Mutex<HashMap<usize, ThreadExecuteTimings>> =
@@ -434,6 +509,7 @@ fn execute_batches_internal(
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
                     None::<fn(&_) -> _>,
+                    mev_batch_sender,
                 ));
 
                 let thread_index = replay_tx_thread_pool.current_thread_index().unwrap();
@@ -492,6 +568,11 @@ fn process_batches(
     batch_execution_timing: &mut BatchExecutionTiming,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    // Not forwarded into the unified scheduler branch because the scheduler
+    // executes transactions asynchronously on its own threads; `execute_batch`
+    // is never called from that path.  Only the rayon (non-scheduler) branch
+    // propagates this sender all the way to `execute_batch`.
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> Result<()> {
     if bank.has_installed_scheduler() {
         debug!(
@@ -535,6 +616,7 @@ fn process_batches(
             batch_execution_timing,
             log_messages_bytes_limit,
             prioritization_fee_cache,
+            mev_batch_sender,
         )
     }
 }
@@ -577,6 +659,7 @@ fn execute_batches(
     timing: &mut BatchExecutionTiming,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> Result<()> {
     if locked_entries.len() == 0 {
         return Ok(());
@@ -611,6 +694,7 @@ fn execute_batches(
         replay_vote_sender,
         log_messages_bytes_limit,
         prioritization_fee_cache,
+        mev_batch_sender,
     )?;
 
     // Pass false because this code-path is never touched by unified scheduler.
@@ -683,6 +767,7 @@ pub fn process_entries_for_tests(
         &mut batch_timing,
         None,
         None,
+        None, // no MEV hook in test utility path
     );
 
     debug!("process_entries: {batch_timing:?}");
@@ -698,6 +783,7 @@ fn process_entries(
     batch_timing: &mut BatchExecutionTiming,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> Result<()> {
     // accumulator for entries that can be processed in parallel
     let mut batches = vec![];
@@ -732,6 +818,7 @@ fn process_entries(
                             batch_timing,
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
+                            mev_batch_sender,
                         )
                     },
                 )?;
@@ -747,6 +834,7 @@ fn process_entries(
         batch_timing,
         log_messages_bytes_limit,
         prioritization_fee_cache,
+        mev_batch_sender,
     )?;
     for hash in tick_hashes {
         bank.register_tick(&hash);
@@ -1121,6 +1209,11 @@ fn confirm_full_slot(
     replay_vote_sender: Option<&ReplayVoteSender>,
     timing: &mut ExecuteTimings,
     migration_status: &MigrationStatus,
+    // Startup ledger replay and genesis processing do not drive a live MEV
+    // engine, so all callers of this function pass `None`.  The parameter
+    // exists here solely so that `confirm_slot` can carry a uniform signature
+    // whether called from the startup path or the runtime replay path.
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let mut confirmation_timing = ConfirmationTiming::default();
     let skip_verification = !opts.run_verification;
@@ -1149,6 +1242,7 @@ fn confirm_full_slot(
         opts.runtime_config.log_messages_bytes_limit,
         None,
         migration_status,
+        mev_batch_sender,
     )?;
 
     timing.accumulate(&confirmation_timing.batch_execute.totals);
@@ -1630,6 +1724,12 @@ pub fn confirm_slot(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
     migration_status: &MigrationStatus,
+    // This is the live injection point for replay_stage.  Pass
+    // `Some(&sender)` from the runtime replay loop to activate the MEV hook;
+    // pass `None` from the startup / test paths where no MEV engine is
+    // connected.  The sender is forwarded unchanged into every
+    // `confirm_slot_entries()` call within this function.
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
 
@@ -1680,6 +1780,7 @@ pub fn confirm_slot(
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
                     migration_status,
+                    mev_batch_sender,
                 )?;
             }
             BlockComponent::BlockMarker(marker) => {
@@ -1721,6 +1822,11 @@ fn confirm_slot_entries(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
     migration_status: &MigrationStatus,
+    // Forwarded unchanged through process_entries → process_batches →
+    // execute_batches → execute_batches_internal → execute_batch.
+    // Fires once per account-lock group of transactions, mid-slot, the
+    // instant the SVM commit returns.
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let ConfirmationTiming {
         confirmation_elapsed,
@@ -1944,6 +2050,7 @@ fn confirm_slot_entries(
         batch_execute_timing,
         log_messages_bytes_limit,
         prioritization_fee_cache,
+        mev_batch_sender,
     )
     .map_err(BlockstoreProcessorError::from);
     replay_timer.stop();
@@ -1962,382 +2069,6 @@ fn confirm_slot_entries(
 
     Ok(())
 }
-
-
-
-/// Execute a batch of shredstream entries speculatively, writing results into
-/// the provided bank's write cache without performing PoH hash-chain or Ed25519
-/// signature verification.
-///
-/// The canonical `confirm_slot_entries` pipeline has four phases:
-///
-///   1. Tick verification — checks that `bank.tick_height + entries.tick_count()`
-///      does not exceed `bank.max_tick_height()`, that each tick's PoH hash is
-///      correct, and that hash counts match `bank.hashes_per_tick()`.
-///
-///   2. PoH verification — `entry::entries_to_verification_data` + async spawn
-///      via `progress.async_verification` — validates the sequential SHA-256
-///      hash chain from one entry's `hash` field to the next.
-///
-///   3. Transaction hashing and sanitization — `entry::validate_and_hash_transactions`
-///      converts each `VersionedTransaction` into a
-///      `RuntimeTransaction<SanitizedTransaction>` by calling
-///      `bank.verify_transaction_with_serialized_message`, which:
-///        · validates message format (account index counts, etc.)
-///        · resolves Address Lookup Table entries against the bank's accounts DB
-///        · computes and caches the message hash via `tx.message.hash()`
-///        · checks precompile programs (Ed25519/Secp256k1 instruction format)
-///        Does NOT run Ed25519 batch signature verification — that is deferred
-///        to the `unverified_signatures.verify()` call in phase 4.
-///
-///   4. Ed25519 batch signature verification — `unverified_signatures.verify()`
-///      runs all 64-byte signature checks in parallel.
-///
-/// This function performs phases 1–3 exactly as in the canonical path. It
-/// intentionally omits phases 2 (PoH hash-chain) and 4 (Ed25519 batch
-/// verification). Phase 1 tick bounds are not enforced because shredstream
-/// delivers partial slot entry batches — the full tick count for a slot is
-/// not available until the final batch arrives.
-///
-/// The `ValidatedHashedTransactions::unverified_signatures` field is
-/// deliberately discarded without calling `.verify()`. This means transactions
-/// with invalid Ed25519 signatures will be executed in the speculative path
-/// even though they would be rejected in canonical replay. The canonical path
-/// detects and rejects them, eventually marking the slot Dead if invalid-sig
-/// transactions appear — this divergence is the accepted cost of sub-latency
-/// execution. The speculative result for such a slot must be discarded via
-/// `SpeculativeSlotExecutor::discard_slot()` when the Dead notification arrives.
-///
-/// # Arguments
-///
-/// - `bank`              — A `BankWithScheduler::new_without_scheduler` wrapper
-///                          around the speculative working bank. The rayon-based
-///                          execution path is used because no scheduler is
-///                          installed — this matches what canonical replay uses
-///                          during blockstore-based slot replay. The unified
-///                          scheduler variant is only used for TPU block production.
-///
-/// - `replay_tx_thread_pool` — The validator's existing rayon thread pool,
-///                              shared with the canonical replay stage. Reusing
-///                              the same pool avoids spawning competing OS
-///                              threads that would increase CPU context switching.
-///
-/// - `entries`           — Deserialized entries from the shredstream batch.
-///                          Ownership is transferred here because
-///                          `validate_and_hash_transactions` and `process_entries`
-///                          consume the vector internally.
-///
-/// - `tx_starting_index` — The cumulative count of transactions already executed
-///                          for this slot in all previous shredstream batches.
-///                          Seeded into each `ReplayEntry::starting_index` so
-///                          that the slot-relative sequential transaction index
-///                          assigned by the SVM matches what the canonical path
-///                          would assign via `ConfirmationProgress::num_txs`.
-///                          Pass 0 for the first batch of a slot.
-///
-/// # Returns
-///
-/// `Ok(usize)` — the number of transactions in the provided entries (both
-/// successful and failed). The caller adds this value to the slot's cumulative
-/// transaction total so that the next shredstream batch receives the correct
-/// starting index when it calls this function for the same slot.
-///
-/// `Err(BlockstoreProcessorError)` — if `validate_and_hash_transactions` fails
-/// (malformed transaction format or ALT resolution error), or if `process_entries`
-/// returns a fatal SVM execution error.
-pub fn execute_entries_speculatively(
-    bank: &BankWithScheduler,
-    replay_tx_thread_pool: &ThreadPool,
-    entries: Vec<Entry>,
-    tx_starting_index: usize,
-) -> result::Result<usize, BlockstoreProcessorError> {
-    // -------------------------------------------------------------------------
-    // Build the per-entry slot-relative transaction starting indexes before the
-    // entries vector is consumed by validate_and_hash_transactions.
-    //
-    // Each Entry is either a tick (zero transactions) or a transaction batch
-    // (one or more VersionedTransactions). The slot-relative starting index for
-    // each entry is the sum of all transaction counts in preceding entries plus
-    // the externally-supplied tx_starting_index, which accounts for transactions
-    // already executed in prior shredstream batches for this slot.
-    //
-    // This mirrors the confirm_slot_entries logic where entry_tx_starting_index
-    // accumulates from progress.num_txs across the entries iterator. The indexes
-    // are later zipped with the sanitized entries to construct ReplayEntry values
-    // whose starting_index fields seed the SVM's sequential transaction index
-    // counters — the same counters that determine transaction ordering in the
-    // block's execution record.
-    //
-    // Tick entries have `transactions.len() == 0`, so they neither advance the
-    // starting index nor contribute to num_txs. Only transaction-batch entries
-    // advance both.
-    // -------------------------------------------------------------------------
-    let num_entries = entries.len();
-    let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
-    let mut entry_tx_starting_index = tx_starting_index;
-    let num_txs = entries
-        .iter()
-        .map(|entry| {
-            let count = entry.transactions.len();
-            entry_tx_starting_indexes.push(entry_tx_starting_index);
-            entry_tx_starting_index = entry_tx_starting_index.saturating_add(count);
-            count
-        })
-        .sum::<usize>();
-
-    // -------------------------------------------------------------------------
-    // Sanitize each VersionedTransaction into RuntimeTransaction<SanitizedTransaction>
-    // via bank.verify_transaction_with_serialized_message.
-    //
-    // validate_and_hash_transactions iterates the entries, calling the provided
-    // closure for each transaction. The closure receives both the deserialized
-    // VersionedTransaction and its raw serialized bytes (from the shred payload).
-    // Using verify_transaction_with_serialized_message avoids re-serializing the
-    // message just to compute its hash — the serialized bytes from the shred are
-    // passed directly to the hash computation, saving one bincode round-trip per
-    // transaction compared to the `verify_transaction` path.
-    //
-    // `TransactionVerificationMode::HashOnly` instructs the function to:
-    //   · Validate the transaction's message format (no malformed account indexes)
-    //   · Resolve Address Lookup Table entries against the bank's accounts DB
-    //   · Compute and cache the message hash from the provided serialized bytes
-    //   · Check precompile program instruction format (Ed25519/Secp256k1)
-    //   · Skip Ed25519 and Secp256k1 batch signature verification entirely
-    //
-    // The result type is ValidatedHashedTransactions, which bundles:
-    //   · `entries`: Vec<EntryType<RuntimeTransaction<SanitizedTransaction>>>
-    //     ready to be zipped into ReplayEntry values for process_entries.
-    //   · `unverified_signatures`: an opaque handle to the pending Ed25519
-    //     batch-verification work. In the canonical path, `.verify()` is called
-    //     to run the batch check. Here, the handle is intentionally dropped
-    //     without calling `.verify()` — this is the mechanism by which the
-    //     speculative path elides Ed25519 signature checking.
-    //
-    // Dropping unverified_signatures without calling verify() is safe: the
-    // handle contains no critical resources and no background threads wait on it.
-    // The only consequence is that invalid-sig transactions proceed to execution
-    // where they would be rejected in canonical replay — a known and accepted
-    // divergence detailed in the function-level documentation above.
-    // -------------------------------------------------------------------------
-    let validate_and_hash_transaction = {
-        let bank = bank.clone_with_scheduler();
-        move |versioned_tx: VersionedTransaction,
-              serialized_message: &[u8]|
-              -> Result<RuntimeTransaction<SanitizedTransaction>> {
-            // verify_transaction_with_serialized_message combines ALT resolution,
-            // message hash computation, and precompile format checking in one call.
-            // The serialized_message bytes come directly from the shred payload,
-            // avoiding a redundant bincode serialization that `verify_transaction`
-            // would need to perform internally.
-            bank.verify_transaction_with_serialized_message(
-                versioned_tx,
-                serialized_message,
-                TransactionVerificationMode::HashOnly,
-            )
-        }
-    };
-
-    // The transaction-hash-verify pool (not replay_tx_thread_pool) is passed here
-    // for two reasons rooted in the fact that replay_tx_thread_pool is shared with
-    // canonical replay's process_entries, which runs concurrently on the same validator:
-    //
-    //   1. Thread isolation: validate_and_hash_transactions submits rayon tasks to the
-    //      provided pool. Using replay_tx_thread_pool here would allow speculative hash
-    //      verification work to steal rayon workers from canonical transaction execution,
-    //      introducing latency jitter into the canonical pipeline on every speculative batch.
-    //
-    //   2. Canonical parity: confirm_slot_entries (line ~1843) calls
-    //      validate_and_hash_transactions with transaction_hash_verify_thread_pool(),
-    //      not the replay pool. Using the same pool here keeps the speculative path
-    //      structurally identical to canonical replay for this phase.
-    //
-    // transaction_hash_verify_thread_pool() is a static OnceLock<ThreadPool> with
-    // TX_HASH_VERIFY_THREAD_POOL_SIZE (4) threads named "solReplayHash{i:02}",
-    // dedicated exclusively to hash verification and never used for SVM execution.
-    // -------------------------------------------------------------------------
-    // Fix 1 — ALT resolution failures are soft errors in the speculative path.
-    //
-    // validate_and_hash_transactions calls bank.verify_transaction_with_serialized_message
-    // for each transaction, which resolves Address Lookup Table entries against the
-    // bank's accounts DB. In the Level-3 parent scenario (parent slot is in BankForks
-    // but not yet frozen — the normal shredstream-ahead-of-canonical case), the child
-    // bank was forked from a partially-executed parent whose final state is not yet
-    // committed. A transaction that creates an ALT in an earlier batch for this same
-    // slot would have failed that earlier batch via BlockhashNotFound (see Fix 2
-    // below). As a result, the ALT account does not yet exist in the speculative bank
-    // when this batch arrives.
-    //
-    // Propagating the error hard (the original `?`) causes the batch to be dropped
-    // entirely: the caller's `exec_result.map_err(...)? `propagates to the bridge,
-    // which logs a warning and discards the batch without storing it in
-    // pending_proto_batches. No rebase ever re-executes it, so the MEV engine
-    // never receives the correct speculative update for these transactions.
-    //
-    // Returning Ok(num_txs) instead stores the batch for rebase. During
-    // confirm_slot Phase 2 the batch is re-executed against the now-frozen
-    // canonical parent bank, where the ALT exists and the blockhash is registered.
-    // The re-execution succeeds and the correction update carries the accurate
-    // account delta to the engine.
-    //
-    // Invariant preserved: process_entries is never called when validate_and_hash
-    // fails, so no transactions are committed to the bank. The caller's unconditional
-    // clear_slot_signatures() call is a no-op. tx_count is advanced by num_txs, which
-    // is correct — the rebase must use the same slot-relative starting indexes.
-    // -------------------------------------------------------------------------
-    let entry::ValidatedHashedTransactions {
-        entries,
-        // Ed25519 batch verification is intentionally skipped: dropping this
-        // handle without calling .verify() is the mechanism by which the speculative
-        // path elides signature checking. Transactions with invalid signatures are
-        // executed speculatively; canonical replay subsequently detects them and marks
-        // the slot Dead. SpeculativeSlotExecutor::discard_slot() must then be called
-        // to evict the slot's results from the speculative cache.
-        unverified_signatures: _,
-    } = match entry::validate_and_hash_transactions(
-        entries,
-        num_txs,
-        transaction_hash_verify_thread_pool(),
-        validate_and_hash_transaction,
-    ) {
-        Ok(v) => v,
-        // ALT resolution failure: the ALT may not exist in this speculative bank
-        // because its creating transaction was in a prior batch that failed due to
-        // the unfrozen Level-3 parent. Return Ok so the batch is stored and can be
-        // correctly re-executed during the confirm_slot rebase against the frozen
-        // canonical parent where the ALT is guaranteed to exist.
-        Err(_) => return Ok(num_txs),
-    };
-
-    // -------------------------------------------------------------------------
-    // Build ReplayEntry values by zipping sanitized entries with their
-    // pre-computed slot-relative starting indexes.
-    //
-    // In the canonical path, the vote-only-bank check happens here:
-    // entries containing non-vote transactions are rejected if the bank was
-    // created in vote-only mode (slot distance > MAX_ROOT_DISTANCE_FOR_VOTE_ONLY).
-    // The speculative path omits this check because:
-    //   a) A speculative bank that is vote-only was created with vote_only_bank=true
-    //      via NewBankOptions, which makes process_entries enforce the vote-only
-    //      constraint internally during execution.
-    //   b) A vote-only-mode slot is already far behind the root — in practice,
-    //      the shredstream path would rarely be receiving entries for such a slot.
-    // process_entries will surface a BlockstoreProcessorError if a non-vote
-    // transaction actually executes against a vote-only bank, so the failure
-    // mode is caught rather than silently ignored.
-    // -------------------------------------------------------------------------
-    let replay_entries: Vec<ReplayEntry> = entries
-        .into_iter()
-        .zip(entry_tx_starting_indexes)
-        .map(|(entry, starting_index)| ReplayEntry {
-            entry,
-            starting_index,
-        })
-        .collect();
-
-    // -------------------------------------------------------------------------
-    // Execute entries through the canonical process_entries pipeline.
-    //
-    // process_entries handles:
-    //   · Tick accumulation and block boundary detection via bank.is_block_boundary()
-    //   · Account lock acquisition and conflict detection via try_lock_accounts()
-    //   · Parallel execution across the rayon thread pool via execute_batches()
-    //   · Committing executed transactions into the bank's write cache
-    //   · Registering accumulated tick hashes via bank.register_tick()
-    //
-    // The BatchExecutionTiming accumulator is required by process_entries to
-    // track wall-clock and per-thread execution metrics. A fresh instance is
-    // created here and discarded afterward — speculative execution timing
-    // must not pollute the validator's canonical replay timing dashboards, because
-    // those dashboards are used to tune thread pool sizing and detect performance
-    // regressions.
-    //
-    // Passing None for transaction_status_sender:
-    //   The canonical path ships per-transaction metadata (pre/post balances, log
-    //   messages, return data) to the RPC status indexer. Speculative transactions
-    //   are unconfirmed; publishing their status before canonical confirmation would
-    //   expose provisionally-invalid data to API consumers querying tx status.
-    //
-    // Passing None for replay_vote_sender:
-    //   The canonical path forwards observed vote transactions to the vote listener
-    //   so tower state can be updated. Forwarding votes from unconfirmed speculative
-    //   slots would inject votes that may never land if the slot comes back Dead,
-    //   corrupting the local tower.
-    //
-    // Passing None for log_messages_bytes_limit:
-    //   Disables program log capture entirely, which is appropriate since no
-    //   status sender consumes the logs in the speculative path.
-    //
-    // Passing None for prioritization_fee_cache:
-    //   process_entries accepts Option<&PrioritizationFeeCache>. Speculative
-    //   transactions from unconfirmed slots must not corrupt the per-program fee
-    //   estimates used by BankingStage during block production — feeding them to
-    //   the real cache would degrade transaction selection quality for any slot
-    //   that subsequently comes back Dead.
-    // -------------------------------------------------------------------------
-    let mut batch_timing = BatchExecutionTiming::default();
-    // -------------------------------------------------------------------------
-    // Fix 2 — Per-transaction errors are soft errors in the speculative path.
-    //
-    // The root cause: the speculative child bank was forked from a Level-3 parent
-    // (in BankForks but not yet frozen). The canonical freeze sequence is:
-    //
-    //   parent_bank.freeze()
-    //     └─ bank.update_slot_hashes()
-    //          └─ sysvar::slot_hashes::update(&bank, last_blockhash)
-    //               └─ blockhash_queue.register_hash(last_blockhash, ...)
-    //
-    // Because freeze() has NOT been called on the Level-3 parent at fork time,
-    // register_hash was never invoked for the parent's final blockhash. Any
-    // transaction in the child slot that references that blockhash hits
-    // check_transaction_for_nonce() → blockhash queue miss → BlockhashNotFound.
-    //
-    // In the canonical path this never happens because Bank::new_from_parent is
-    // always called AFTER the parent is frozen via bank.freeze() in
-    // process_replay_results (replay_stage.rs line 3530).
-    //
-    // Propagating the error hard causes the batch to be dropped, the bank to have
-    // partially committed state (some transactions ran before the failing one),
-    // and the MEV engine to receive nothing for this batch. With the fix applied:
-    //
-    //   · The caller's unconditional clear_slot_signatures() erases every signature
-    //     this batch wrote to the shared BankStatusCache before the error returned,
-    //     preventing AlreadyProcessed errors in canonical replay.
-    //   · Returning Ok(num_txs) stores the batch in pending_proto_batches.
-    //   · confirm_slot Phase 2 re-executes the batch against the now-frozen canonical
-    //     parent where the blockhash is registered — the transactions succeed.
-    //   · The correction update carries the correct account delta to the engine.
-    //
-    // The `other => return Err(other)` arm is unreachable in practice (only
-    // InvalidTransaction flows through this path) but is retained for defensive
-    // correctness — if a future code change introduces a new error class through
-    // process_entries it will be propagated rather than silently swallowed.
-    // -------------------------------------------------------------------------
-    match process_entries(
-        bank,
-        replay_tx_thread_pool,
-        replay_entries,
-        None, // transaction_status_sender
-        None, // replay_vote_sender
-        &mut batch_timing,
-        None, // log_messages_bytes_limit
-        None, // prioritization_fee_cache
-    )
-    .map_err(BlockstoreProcessorError::from)
-    {
-        Ok(()) => {}
-        // BlockhashNotFound (and any other per-transaction error): expected in the
-        // speculative path when the Level-3 parent's final blockhash is not yet
-        // registered. The stored batch will succeed during confirm_slot rebase
-        // against the frozen canonical parent. Soft-continue.
-        Err(BlockstoreProcessorError::InvalidTransaction(_)) => {}
-        // All other error classes (InvalidBlock, FailedToLoadEntries, etc.) are
-        // genuinely fatal and must propagate to the caller as hard errors.
-        Err(other) => return Err(other),
-    }
-
-    Ok(num_txs)
-}
-
 
 // Special handling required for processing the entries in slot 0
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -2363,6 +2094,7 @@ fn process_bank_0(
         None,
         &mut ExecuteTimings::default(),
         migration_status,
+        None, // genesis slot — no MEV engine is active during startup
     )
     .map_err(|err| match err {
         err @ BlockstoreProcessorError::InvalidTransaction(_) => panic!("{err}"),
@@ -2561,6 +2293,7 @@ fn load_frozen_forks(
                 None,
                 timing,
                 &migration_status,
+                None, // startup catchup replay — MEV engine is not yet running
             ) {
                 assert!(bank_forks.write().unwrap().remove(bank.slot()).is_some());
                 if opts.abort_on_invalid_block {
@@ -2795,6 +2528,10 @@ pub fn process_single_slot(
     replay_vote_sender: Option<&ReplayVoteSender>,
     timing: &mut ExecuteTimings,
     migration_status: &MigrationStatus,
+    // Forwarded to confirm_full_slot → confirm_slot → confirm_slot_entries.
+    // Startup ledger replay callers pass `None`; the live replay loop passes
+    // `Some(&sender)` to activate the MEV hook.
+    mev_batch_sender: Option<&MevBatchSender>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
     match check_chained_block_id(blockstore, bank) {
@@ -2835,6 +2572,7 @@ pub fn process_single_slot(
         replay_vote_sender,
         timing,
         migration_status,
+        mev_batch_sender,
     )
     .map_err(|err| {
         warn!("slot {slot} failed to verify: {err}");
@@ -4912,6 +4650,7 @@ pub mod tests {
             None,
             &mut ExecuteTimings::default(),
             &MigrationStatus::default(),
+            None, // unit test — no MEV engine
         )
         .unwrap();
         bank_forks.write().unwrap().set_root(1, None, None);
@@ -5885,6 +5624,7 @@ pub mod tests {
                 };
                 Ok(ok)
             }),
+            None, // unit test — no MEV engine
         );
 
         // pre_commit_callback() should always be called regardless of tx_result

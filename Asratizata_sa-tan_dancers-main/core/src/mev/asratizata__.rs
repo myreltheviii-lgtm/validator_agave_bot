@@ -19,23 +19,23 @@
 //!
 //! The old bot pre-populated a `TrackingFilter` for the Geyser plugin so the
 //! plugin only forwarded account updates that belonged to known pools. In the
-//! integrated architecture, `SpeculativeSlotExecutor.execute()` emits every
-//! account that changed during speculative replay, and `MevEngine` performs the
-//! equivalent filter implicitly: `handle_speculative_update` looks up each account
-//! in its `account_to_mint` reverse index and silently skips any account that is
-//! not in the map. No external `TrackingFilter` or `PoolTracker` object needs to
-//! be constructed or passed anywhere — the map IS the filter.
+//! integrated architecture, `MevEngine::handle_mev_batch` processes each
+//! committed transaction batch and performs the equivalent filter implicitly:
+//! it looks up every touched account in its `account_to_mint` reverse index and
+//! silently skips any account that is not in the map. No external `TrackingFilter`
+//! or `PoolTracker` object needs to be constructed or passed anywhere — the map
+//! IS the filter.
 //!
 //! # Lazy initialisation
 //!
 //! The old bot had a `lazy_init_worker` tokio task that initialised mints on
 //! demand as new pool-state accounts appeared in the Geyser event stream.
 //! In the integrated architecture, `MevEngine::register_mint` fills the same role:
-//! it is `pub` and can be called from the engine's run loop whenever a previously
-//! unknown account appears in a `SpeculativeAccountUpdate`. The initial scan at
-//! startup covers every pool that exists on-chain at the moment the validator
-//! loads its snapshot, so the lazy path is only hit for mints created after the
-//! snapshot slot — a negligible fraction of traffic on mainnet.
+//! it is `pub` and can be called from the engine's graduation handler whenever a
+//! new pool is confirmed by the canonical pipeline. The initial scan at startup
+//! covers every pool that exists on-chain at the moment the validator loads its
+//! snapshot, so the dynamic path is only hit for mints created after the snapshot
+//! slot — a negligible fraction of traffic on mainnet.
 
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
@@ -98,8 +98,7 @@ pub struct MevStartupConfig {
 
 /// Everything `MevEngine::new` needs beyond the channel parameters that
 /// `validator.rs` already holds at the time it constructs the engine
-/// (the channel receivers, `bank_forks`, `speculative_executor`, and the
-/// dead-slot channel).
+/// (the channel receivers, `bank_forks`, and the dead-slot channel).
 pub struct MevStartupResult {
     /// Keypair used to sign arbitrage transactions.
     pub wallet: Arc<Keypair>,
@@ -234,6 +233,11 @@ pub fn initialize_mev_components(
     info!("MEV startup: wallet pubkey = {}", wallet.pubkey());
 
     // Step 3 — RPC client
+    //
+    // A single RpcClient is constructed here and shared with the LutManager
+    // (when LUTs are configured) and the MevStartupResult.  Using the operator-
+    // supplied URL for both purposes ensures that LUT account fetching and
+    // transaction submission use the same validated endpoint.
     let rpc_client = Arc::new(RpcClient::new(config.rpc_url.clone()));
     info!("MEV startup: RPC endpoint = {}", config.rpc_url);
 
@@ -244,13 +248,18 @@ pub fn initialize_mev_components(
     // in a single place — the validator's CLI arguments — and eliminates a
     // hidden runtime dependency on environment variable state that could go
     // unnoticed during deployment.
+    //
+    // The same `rpc_client` constructed in Step 3 is reused for LUT fetching.
+    // Creating a second client with a hardcoded URL would bypass the operator's
+    // `--mev-rpc-url` setting and silently fall back to a third-party endpoint
+    // regardless of cluster configuration.
     let lut_manager = if !config.lut_addresses.is_empty() {
         info!(
             "MEV startup: loading {} LUT(s) from CLI configuration",
             config.lut_addresses.len()
         );
         Arc::new(
-            LutManager::new_with_luts(config.lut_addresses.clone(), &Arc::new(RpcClient::new("https://mainnet.helius-rpc.com/?api-key=db75ab85-690e-483d-b351-dc1bd0a2e9b3".to_string())))
+            LutManager::new_with_luts(config.lut_addresses.clone(), &rpc_client)
                 .context("MEV startup: failed to load address lookup tables")?,
         )
     } else {
@@ -292,7 +301,7 @@ pub fn initialize_mev_components(
     // picture of all existing pools before the engine begins processing
     // shredstream entries, eliminating the need for a cold-start discovery
     // window.  Pools created after this snapshot are discovered incrementally
-    // by the background task in `MevEngine`.
+    // by the graduation pipeline in `MevEngine`.
     let discovery = scan_all_mints_no_init(&bank)
         .context("MEV startup: pool scan failed")?;
     info!(

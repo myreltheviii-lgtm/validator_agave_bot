@@ -1294,6 +1294,10 @@ impl TaskHandler for DefaultTaskHandler {
             handler_context.log_messages_bytes_limit,
             handler_context.prioritization_fee_cache.as_deref(),
             pre_commit_callback,
+            // The unified scheduler dispatches transactions on its own internal
+            // threads asynchronously; there is no MEV batch hook wired into this
+            // execution path, so the sender is explicitly absent here.
+            None,
         );
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
     }

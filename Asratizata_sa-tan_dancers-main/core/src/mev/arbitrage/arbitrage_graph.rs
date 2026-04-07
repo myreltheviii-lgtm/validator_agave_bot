@@ -17,64 +17,43 @@ use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
 // → executor cycles.)
 // ---------------------------------------------------------------------------
 
-/// Signals that a pool account was modified by speculative or canonical execution
-/// and that affected arbitrage pairs should be re-evaluated.
+/// Signals that one or more pool accounts were modified by a committed
+/// transaction batch and that affected arbitrage pairs should be re-evaluated.
+///
+/// Every event is produced by `MevEngine::handle_mev_batch` immediately after
+/// `execute_batch()` returns inside canonical replay.  The bank attached to the
+/// event has already committed all writes from this batch — account state is
+/// live and readable with no further locking.
 ///
 /// # Bank lifetime and RAM
 ///
-/// `speculative_bank` is an `Arc<Bank>`. Agave banks are large — a single
-/// speculative bank for an active slot holds all accounts touched during
-/// speculative entry execution and can reach hundreds of megabytes. The
-/// executor MUST drop the `Arc<Bank>` (by dropping the whole event or by
-/// explicitly taking and dropping just this field) as soon as it has finished
-/// reading account state from it. Holding unconsumed events in a broadcast
-/// channel buffer while the bank reference is live is the primary mechanism
-/// driving unbounded RAM growth in the MEV pipeline.
+/// `bank` is an `Arc<Bank>`.  Agave banks are large — a canonical bank for an
+/// active slot holds all accounts touched during replay and can reach hundreds
+/// of megabytes.  The executor MUST drop the event (and therefore the `Arc<Bank>`
+/// clone it carries) as soon as it has finished reading account state.  Holding
+/// unconsumed events in the broadcast channel buffer is the primary mechanism
+/// driving unbounded RAM growth — each event keeps its bank alive until every
+/// receiver drops its copy.
 #[derive(Clone)]
 pub struct MevPoolUpdateEvent {
-    /// The pool state address (vault, tick array, etc.) that changed.
+    /// The pool state address (vault, tick array, oracle, etc.) that was
+    /// touched by a successfully committed transaction in this batch.
     pub pool_address: Pubkey,
 
-    /// The speculative bank whose write cache already holds the post-execution
-    /// state of all accounts touched by this shredstream batch. Simulating
-    /// against this bank gives the forward-looking pool view ~200 ms before
-    /// canonical confirmation. `None` for canonical-source events.
-    pub speculative_bank: Option<std::sync::Arc<solana_runtime::bank::Bank>>,
+    /// The canonical replay bank whose committed state reflects all writes
+    /// from the current batch.  The executor calls
+    /// `bank.simulate_transaction_unchecked` against this bank directly.
+    /// The bank is not yet frozen — the slot is still in progress — but
+    /// `simulate_transaction_unchecked` does not require a frozen bank, so
+    /// simulation is safe and the result reflects the most current on-chain
+    /// state available at this instant.
+    pub bank: std::sync::Arc<solana_runtime::bank::Bank>,
 
-    /// Blockhash from the speculative bank (or canonical bank if no speculative
-    /// bank is available) used when building the arbitrage transaction.
+    /// Blockhash drawn from `bank.last_blockhash()` at event construction
+    /// time.  Used when building the arbitrage transaction message so the
+    /// transaction references a recent valid blockhash without a separate
+    /// bank read inside the executor.
     pub blockhash: solana_hash::Hash,
-
-    /// Whether this update originated from speculative shredstream execution
-    /// (`true`) or from a canonical correction (`false`). Logged for latency
-    /// tracking.
-    pub from_speculative_execution: bool,
-
-    /// Whether this event is a canonical rebase correction (`true`) or an
-    /// incremental batch delta (`false`).
-    ///
-    /// A speculative pipeline for a given slot produces two kinds of events
-    /// through the same broadcast channel:
-    ///
-    ///   · `false` — an incremental delta from one shredstream batch delivery.
-    ///     The executor accumulates these as the slot progresses. Each event
-    ///     reports only what changed during that specific delivery.
-    ///
-    ///   · `true` — a rebase correction produced by `confirm_slot` after the
-    ///     parent slot was canonically verified and all stored child-slot batches
-    ///     were re-executed against the verified parent. The accounts map in the
-    ///     originating `SpeculativeAccountUpdate` holds the TOTAL accumulated
-    ///     effect of every batch for this child slot, measured from the canonical
-    ///     parent. The executor must REPLACE all prior cached state it holds for
-    ///     this slot with exactly the state produced by this correction — any
-    ///     accumulated incremental deltas from earlier in the same slot are now
-    ///     superseded and must be discarded.
-    ///
-    /// Treating a correction as another incremental accumulation is a silent
-    /// state corruption: the post-rebase result would be added on top of the
-    /// prior speculative state rather than replacing it, producing a pool view
-    /// that no transaction ever actually created.
-    pub is_correction: bool,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -110,27 +89,6 @@ pub struct PoolInfo {
     pub pool_type: PoolType,
     pub token_x: Pubkey,
     pub token_y: Pubkey,
-}
-
-#[derive(Clone, Debug)]
-pub struct PoolUpdateEvent {
-    pub pool_address: Pubkey,
-    pub speculative_bank: std::sync::Arc<solana_runtime::bank::Bank>,
-    pub slot: solana_clock::Slot,
-}
-
-impl PoolUpdateEvent {
-    pub fn new(
-        pool_address: Pubkey,
-        speculative_bank: std::sync::Arc<solana_runtime::bank::Bank>,
-        slot: solana_clock::Slot,
-    ) -> Self {
-        Self {
-            pool_address,
-            speculative_bank,
-            slot,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -324,9 +282,10 @@ fn canonical_pair_key(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
 }
 
 // Build the reverse index: every account pubkey that appears in any parsed pool
-// struct maps to that pool's canonical address. When SpeculativeSlotExecutor fires
-// a SpeculativeAccountUpdate, the engine can perform an O(1) lookup of the vault,
-// tick array, or pool account to find the owning pool without iterating all pools.
+// struct maps to that pool's canonical address. When MevEngine::handle_mev_batch
+// processes a committed transaction batch, it can perform an O(1) lookup of each
+// touched vault, tick array, or pool account to find the owning pool and route a
+// MevPoolUpdateEvent to the correct ArbitrageExecutor without iterating all pools.
 fn build_account_to_pool_map(pool_data: &crate::mev::pools::MintPoolData) -> FxHashMap<Pubkey, Pubkey> {
     let mut map: FxHashMap<Pubkey, Pubkey> = FxHashMap::default();
 
@@ -556,7 +515,7 @@ impl ArbitrageGraph {
             });
         }
 
-        tracing::debug!("Total pools collected for graph building: {}", all_pools.len());
+        info!("Total pools collected for graph building: {}", all_pools.len());
 
         // Build the token-pair index and known-address deduplication set in a single
         // pass. The canonical key sorts the two mint pubkeys so (A, B) and (B, A)
@@ -635,8 +594,8 @@ impl ArbitrageGraph {
     /// connect it with every existing pool that trades the same token pair.
     ///
     /// This is the graduation fast path.  When the shredstream bridge detects
-    /// a pool-creation instruction and the speculative executor confirms the
-    /// account exists in the write cache, the engine calls this method to make
+    /// a pool-creation instruction and the canonical pipeline confirms the
+    /// account exists in a committed bank, the engine calls this method to make
     /// the new pool visible to all running ArbitrageExecutor tasks without any
     /// restart or re-registration.
     ///
@@ -676,8 +635,8 @@ impl ArbitrageGraph {
         }
 
         // Register every account that belongs to this pool in the reverse index.
-        // From this moment, any SpeculativeAccountUpdate that touches one of these
-        // accounts will route to this pool's address via account_to_pool.
+        // From this moment, any MevPoolUpdateEvent that touches one of these accounts
+        // will route to this pool's address via account_to_pool.
         for account in pool_accounts {
             self.account_to_pool.insert(*account, new_pool.address);
         }
@@ -791,7 +750,8 @@ impl ArbitrageGraph {
     /// Returns every on-chain account pubkey that this graph tracks across all
     /// pools for this mint. The set includes pool state accounts, vaults, tick
     /// arrays, bin arrays, oracle accounts, and bitmap extensions — every address
-    /// that, if mutated by a speculative entry batch, could affect an arb pair.
+    /// that, if mutated by an entry batch committed to the canonical bank, could
+    /// affect an arb pair.
     ///
     /// `MevEngine` stores this list in `MintState::tracked_accounts` so that when
     /// a mint is later de-registered its entries can be bulk-removed from the

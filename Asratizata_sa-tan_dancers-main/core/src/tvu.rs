@@ -48,7 +48,8 @@ use {
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::Blockstore, blockstore_cleanup_service::BlockstoreCleanupService,
-        blockstore_processor::TransactionStatusSender, entry_notifier_service::EntryNotifierSender,
+        blockstore_processor::{MevBatchSender, TransactionStatusSender},
+        entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_poh::{poh_controller::PohController, poh_recorder::PohRecorder},
@@ -254,6 +255,10 @@ impl Tvu {
         // descendant so that arbitrage simulation can never proceed against
         // account state the network has permanently discarded.
         mev_dead_slot_sender: crossbeam_channel::Sender<Slot>,
+        // Tvu does not own or consume this channel — it is forwarded
+        // straight into ReplaySenders for ReplayStage to wire down to
+        // execute_batch.
+        mev_batch_sender: MevBatchSender,
     ) -> Result<Self, String> {
         let migration_status = bank_forks.read().unwrap().migration_status();
 
@@ -527,6 +532,7 @@ impl Tvu {
             // — Tvu does not inspect or buffer the values that flow through them.
             mev_frozen_bank_sender,
             mev_dead_slot_sender,
+            mev_batch_sender,
         };
 
         let replay_receivers = ReplayReceivers {

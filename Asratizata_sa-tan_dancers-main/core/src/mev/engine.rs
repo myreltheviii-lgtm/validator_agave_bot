@@ -1,21 +1,18 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::Receiver;
-use solana_account::{AccountSharedData, ReadableAccount};
 use solana_client::rpc_client::RpcClient;
 use solana_clock::Slot;
-use solana_ledger::devil_mode_jito__::{SpeculativeAccountUpdate, SpeculativeSlotExecutor};
+pub use solana_ledger::blockstore_processor::MevExecutedBatch;
 use solana_runtime::bank::Bank;
 use solana_runtime::bank_forks::BankForks;
 use solana_pubkey::Pubkey;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use tokio::sync::{broadcast, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::mev::arbitrage::{ArbitrageGraph, ArbitrageGraphConfig, MevPoolUpdateEvent, PoolInfo, PoolType};
 use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
@@ -69,149 +66,87 @@ struct MintState {
     pool_update_tx: broadcast::Sender<MevPoolUpdateEvent>,
     /// Every on-chain account pubkey this mint's pools require, stored here so
     /// they can be removed from `account_to_mint` in bulk if the mint is
-    /// ever de-registered (not yet implemented, but the structure is ready).
-    /// Updated on graduation to include newly discovered vault accounts.
+    /// ever de-registered.  Updated on graduation to include newly discovered
+    /// vault accounts.
     tracked_accounts: Vec<Pubkey>,
 }
 
-/// Timing record for a single actively-speculated slot.
-///
-/// Created the moment the first shredstream batch for a slot is dispatched
-/// through `handle_speculative_update`. Consumed and dropped when `handle_frozen_bank`
-/// fires for the same slot — at that point the lead time is computed and logged.
-///
-/// The lead time is the wall-clock gap between when speculative execution first
-/// produced account state for this slot and when canonical replay froze the slot.
-/// A positive lead time means speculative execution ran ahead of canonical — the
-/// normal operating condition. A near-zero or negative lead time means canonical
-/// replay is catching up to or overtaking shredstream delivery, indicating the
-/// validator is under load or shredstream is delayed.
-struct SlotTiming {
-    /// Wall-clock time when the first shredstream batch for this slot arrived
-    /// at `handle_speculative_update`. This is measured inside the engine's
-    /// select loop, not inside `execute()` in the bridge — so it includes the
-    /// channel transit time from the bridge task to the engine, which is
-    /// typically sub-microsecond for an in-process crossbeam channel.
-    first_speculative_at: Instant,
-
-    /// Number of shredstream entry batches processed for this slot. Each batch
-    /// is one gRPC message from the shredstream proxy. Multiple batches per slot
-    /// are normal — the leader produces entries progressively across the slot's
-    /// 400ms window and shredstream delivers each group as it is produced. A
-    /// slot with many transactions will have more batches than a sparse slot.
-    batch_count: u32,
-
-    /// Number of pool-update events successfully broadcast to executors for
-    /// this slot. Zero means no tracked pools were touched by any transaction
-    /// in this slot's speculative batches — the slot was irrelevant for arb.
-    /// A positive count means at least one executor was woken to simulate.
-    events_broadcast: u32,
-}
-
 pub struct MevEngine {
-    update_rx: Receiver<SpeculativeAccountUpdate>,
-    /// Sender half of the speculative account-update channel.  Cloned into
-    /// `run_speculative_executor` so the shredstream bridge task can push
-    /// `SpeculativeAccountUpdate` values into this engine's `update_rx` without
-    /// needing a direct reference to the engine itself.
-    speculative_update_tx: crossbeam_channel::Sender<SpeculativeAccountUpdate>,
+    /// Receives `MevExecutedBatch` values from `execute_batch()` in
+    /// `blockstore_processor.rs`.  Every time a transaction batch commits to the
+    /// canonical replay bank mid-slot, one payload arrives here carrying the
+    /// committed bank, the sanitized transactions, and their commit results.
+    /// This is the earliest possible signal: the hook fires before
+    /// `bank.freeze()`, before `TransactionStatusService`, and before any Geyser
+    /// plugin notification.
+    mev_batch_rx: Receiver<MevExecutedBatch>,
     /// Receives frozen canonical banks directly from `ReplayStage` the moment
-    /// `bank.freeze()` completes.  Bypassing `OptimisticallyConfirmedBankTracker`
-    /// eliminates three sources of latency and correctness risk:
-    ///
-    /// 1. The no-RPC path vulnerability: when `config.rpc_addrs` is `None` the
-    ///    tracker is never constructed and `bank_notification_sender` events are
-    ///    never forwarded — the engine would run blind.  With a direct channel
-    ///    the connection is independent of whether RPC is enabled.
-    ///
-    /// 2. The dependency-tracker coupling: the tracker thread waits for
-    ///    transaction-status processing to complete before forwarding the Frozen
-    ///    event.  That wait can take many milliseconds on a busy validator.  A
-    ///    direct channel has zero additional latency.
-    ///
-    /// 3. The BankForks lookup: the tracker strips the `Arc<Bank>` and sends only
-    ///    `(slot, parent_slot)`, forcing the engine to re-acquire the BankForks
-    ///    read lock to recover the bank.  The direct channel carries the already-
-    ///    cloned `Arc<Bank>` so no lock acquisition is needed in the engine.
+    /// `bank.freeze()` completes.  Used to drive pool-graduation Phase 2 when a
+    /// new pool's creation transaction lands just before slot completion.
     bank_rx: Receiver<Arc<Bank>>,
     /// Receives dead-slot numbers from `ReplayStage::mark_dead_slot`.
     ///
     /// A slot is declared dead when the canonical replay pipeline rejects it due
-    /// to an invalid PoH hash chain, failed Ed25519 batch verification, SVM
-    /// execution error, or chained block-ID mismatch.  Dead slots travel a
-    /// completely separate path from frozen banks — they emit `SlotUpdate::Dead`
-    /// to RPC WebSocket subscribers but never flow through `bank_notification_sender`.
-    /// This dedicated channel is therefore the only reliable way for the engine to
-    /// learn that a slot is dead.
-    ///
-    /// On receipt, `discard_slot` atomically removes the dead slot and all of its
-    /// speculative descendants from the internal `slot_banks` map.  Without this
-    /// eviction, speculative banks built on invalid entries would persist
-    /// indefinitely and the engine would simulate arbitrage against account state
-    /// the network has permanently rejected.
+    /// to invalid PoH, failed signature batch verification, SVM execution error,
+    /// or chained block-ID mismatch.  On receipt the engine sweeps `pending_ready`
+    /// entries for that slot and forwards the slot to the graduation detector in
+    /// the bridge so it can clear its per-DEX pending maps.
     dead_slot_rx: Receiver<Slot>,
-    /// Sender half of the engine→bridge dead-slot forwarding channel.
-    ///
-    /// When the engine's select loop receives a dead slot from `dead_slot_rx`, it
-    /// immediately forwards a copy to the bridge task via this sender.  The bridge
-    /// calls `detector.clear_dead_slot(slot)` to sweep its per-DEX pending maps,
-    /// preventing stale entries from accumulating and crowding out genuine new-pool
-    /// detections.
-    ///
-    /// This explicit forwarding channel replaces the earlier pattern of calling
-    /// `self.dead_slot_rx.clone()` before spawning the bridge.  In crossbeam, cloning
-    /// a `Receiver` creates a SECOND INDEPENDENT consumer — both the engine's select
-    /// loop and the bridge's try_recv() loop drain from the SAME underlying queue.
-    /// Dead-slot messages are therefore split non-deterministically: one consumer sees
-    /// some subset and the other sees the rest.  The engine misses slots the bridge
-    /// consumed; the bridge misses slots the engine consumed.  Using a dedicated channel
-    /// means each side always sees every event.
-    bridge_dead_slot_tx: crossbeam_channel::Sender<Slot>,
-    /// Receiver half of the engine→bridge forwarding channel.  Wrapped in `Option`
-    /// so `run_async` can move it out via `take()` into the bridge spawn closure
-    /// exactly once without requiring the whole `MevEngine` to be wrapped in an `Arc`.
-    bridge_dead_slot_rx: Option<crossbeam_channel::Receiver<Slot>>,
     /// Receives `DetectedPool` values from the shredstream bridge whenever it
     /// observes a pool-creation instruction in the raw entry stream.
     ///
     /// The bridge performs Phase 1 of the two-phase graduation pipeline: scanning
     /// raw instruction bytes for DEX-specific pool-creation discriminators before
-    /// any bank execution has occurred.  The engine performs Phase 2: waiting for
-    /// the `SpeculativeAccountUpdate` that confirms the creation transaction
-    /// succeeded, then integrating the new pool into the arb graph.
-    ///
-    /// Using a crossbeam channel (not tokio) lets this arm participate in the same
-    /// `crossbeam_channel::select!` as the other engine inputs without mixing async
-    /// and synchronous polling.
+    /// any bank execution has occurred.  The engine performs Phase 2: when a
+    /// `MevExecutedBatch` arrives whose committed transactions include the detected
+    /// pool address, the creation is confirmed and the pool is integrated into the
+    /// arb graph using the bank that just committed those transactions.
     graduation_rx: Receiver<DetectedPool>,
     /// Sender half of the graduation channel, stored here so it can be moved into
     /// the bridge spawn inside `run_async`.  Wrapped in `Option` so `take()` can
     /// transfer ownership exactly once without cloning.
     graduation_tx: Option<crossbeam_channel::Sender<DetectedPool>>,
+    /// Sender half of the engine→bridge dead-slot forwarding channel.
+    ///
+    /// When the engine receives a dead slot from `dead_slot_rx` it immediately
+    /// echoes it through this channel.  The bridge calls
+    /// `detector.clear_dead_slot(slot)` to sweep its per-DEX pending maps,
+    /// preventing stale entries from accumulating and crowding out genuine
+    /// new-pool detections.  Using a dedicated forwarding channel (rather than
+    /// cloning the receiver) guarantees both endpoints see every event because
+    /// cloning a crossbeam Receiver creates an independent consumer that splits
+    /// messages non-deterministically.
+    bridge_dead_slot_tx: crossbeam_channel::Sender<Slot>,
+    /// Receiver half moved into the bridge spawn in `run_async` exactly once.
+    /// Wrapped in `Option` so `take()` transfers ownership without cloning.
+    bridge_dead_slot_rx: Option<crossbeam_channel::Receiver<Slot>>,
     bank_forks: Arc<RwLock<BankForks>>,
-    speculative_executor: Arc<SpeculativeSlotExecutor>,
     wallet: Arc<Keypair>,
     lut_manager: Arc<LutManager>,
     rpc_client: Arc<RpcClient>,
     base_priority_fee: u64,
     min_profit_lamports: u64,
     /// When true, the executor runs the full simulation pipeline but does not
-    /// submit any transactions. Used to verify that the arb graph, instruction
+    /// submit any transactions.  Used to verify that the arb graph, instruction
     /// builder, and simulation path produce valid results before deploying live
-    /// capital. Independent of `speculative_accuracy_check`.
+    /// capital.
     validation_mode: bool,
     shredstream_url: String,
     simulation_semaphore: Arc<Semaphore>,
-    /// Most recently frozen canonical bank, shared as a fallback with every
-    /// `ArbitrageExecutor`.  Updated on every `bank_rx` message — i.e. every
-    /// time a canonical slot is frozen.  The inner `Option` is `None` only
-    /// during the startup window before the first block has been replayed.
-    canonical_bank: Arc<RwLock<Option<Arc<Bank>>>>,
-    mint_states: HashMap<Pubkey, MintState>,
+    /// Keyed on mint pubkey.  FxHashMap is used throughout because all keys are
+    /// 32-byte Pubkeys, for which SipHash's collision resistance adds no security
+    /// value while costing 4–6× the CPU time of FxHash's identity-style mixing.
+    mint_states: FxHashMap<Pubkey, MintState>,
     /// Reverse index: account pubkey → mint.  Routes each incoming pool-account
-    /// address from a `SpeculativeAccountUpdate` to the correct per-mint broadcast
-    /// channel in O(1) time without iterating over all registered mints.
-    account_to_mint: HashMap<Pubkey, Pubkey>,
+    /// address from a `MevExecutedBatch` to the correct per-mint broadcast channel
+    /// in O(1) time without iterating over all registered mints.
+    ///
+    /// FxHashMap is used because this map is queried for every account key in every
+    /// committed transaction on every batch — the hottest lookup in the engine.
+    /// SipHash's 4–6× overhead over FxHash for 32-byte keys is a measurable penalty
+    /// on this path; FxHash's non-cryptographic mixing is safe because Pubkeys are
+    /// not attacker-controlled hash inputs inside a network service.
+    account_to_mint: FxHashMap<Pubkey, Pubkey>,
     /// Executor fan-out tasks queued up during `new()` and `register_mint()`.
     /// They cannot be spawned at construction time because `MevEngine::new` is
     /// called from the synchronous `Validator::new` context where no Tokio runtime
@@ -220,121 +155,48 @@ pub struct MevEngine {
     pending_executor_starts: Vec<(Arc<ArbitrageExecutor>, broadcast::Receiver<MevPoolUpdateEvent>)>,
     /// Zero-allocation per-batch account list shared with the shredstream bridge.
     ///
-    /// Replaced `Arc<RwLock<HashSet<Pubkey>>>`. The bridge calls
-    /// `ArcSwap::load()` on every entry batch — one atomic pointer read returning
-    /// a `Guard<Arc<Vec<Pubkey>>>`, with no heap allocation and no lock.  The
-    /// engine writes a new Vec only at graduation events (rare): it builds the Vec
-    /// off the hot path and calls `store(Arc::new(new_vec))`, which atomically
+    /// The bridge calls `ArcSwap::load()` on every entry batch — one atomic pointer
+    /// read returning a `Guard<Arc<Vec<Pubkey>>>`, with no heap allocation and no
+    /// lock.  The engine writes a new Vec only at graduation events (rare): it builds
+    /// the Vec off the hot path and calls `store(Arc::new(new_vec))`, which atomically
     /// replaces the pointer.  Guards held by in-flight bridge iterations see a
     /// consistent snapshot until they drop, at which point the old Arc is freed.
-    ///
-    /// Deduplication is preserved: before inserting into the new Vec the engine
-    /// checks `account_to_mint` so no pubkey appears twice.  A plain `HashSet`
-    /// is used internally in `register_mint` to ensure that, then a sorted unique
-    /// Vec is stored.
     cached_accounts_to_watch: Arc<ArcSwap<Vec<Pubkey>>>,
-    /// Per-slot timing records keyed by slot number. An entry is created when the
-    /// first speculative batch for a slot arrives at `handle_speculative_update`
-    /// and is removed when `handle_frozen_bank` fires for that slot. The elapsed
-    /// time between creation and removal is the speculative lead time — how far
-    /// ahead of canonical replay the engine was operating for that slot.
-    ///
-    /// Entries for slots that go dead (via `dead_slot_rx`) are also removed so
-    /// the map does not accumulate stale entries for abandoned forks. The map
-    /// stays small: at steady state it contains only the slots that are
-    /// currently between first speculative delivery and canonical freeze,
-    /// typically 1–3 slots on mainnet.
-    slot_timing: HashMap<Slot, SlotTiming>,
-    /// When true, the engine stores the speculative account state it observes for
-    /// each slot and compares it byte-for-byte against the canonical account state
-    /// once `bank_rx` delivers the frozen bank for that slot.
-    ///
-    /// This flag is completely independent from `validation_mode`. `validation_mode`
-    /// controls whether transactions are submitted. This flag controls whether the
-    /// engine audits its own speculative predictions against canonical ground truth.
-    /// Both can be active simultaneously, or either can be active alone, or neither.
-    ///
-    /// The accuracy check answers one question: does speculative execution reliably
-    /// produce the same account state that canonical replay produces? A consistently
-    /// high match rate means the engine's predictions are trustworthy and full
-    /// production deployment is appropriate. A low match rate means something in the
-    /// speculative path — entry ordering, parent bank selection, fee collector identity,
-    /// or status cache state — is diverging from canonical behavior and needs investigation
-    /// before real capital is deployed.
-    ///
-    /// Zero overhead when false: the snapshot map is never written, read, or allocated.
-    speculative_accuracy_check: bool,
-    /// Per-slot accumulation of the latest speculative account values observed
-    /// across all shredstream batch deliveries for that slot.
-    ///
-    /// Keyed by slot number → (account pubkey → last speculative value). When
-    /// multiple batches arrive for the same slot and touch the same account, the
-    /// last batch's value overwrites the earlier one. This gives a running picture
-    /// of what speculative execution believes the final state of each account will
-    /// be by the time the slot closes.
-    ///
-    /// The outer map is only populated when `speculative_accuracy_check` is true
-    /// AND the batch contains at least one changed account — tick-only batches with
-    /// empty account maps do not allocate a snapshot entry.
-    ///
-    /// When a correction arrives for a child slot via `handle_correction_update`, the
-    /// entire snapshot for that child slot is REPLACED (not merged) with the correction's
-    /// account map. A correction holds the TOTAL re-executed result against the canonical
-    /// parent — any pre-rebase speculative values stored by earlier batches are superseded
-    /// and must be discarded to avoid producing false accuracy mismatches at freeze time.
-    ///
-    /// Entries are removed at canonical freeze (comparison completed) or at dead
-    /// slot receipt (slot invalid, no meaningful comparison possible).
-    ///
-    /// `bank.get_account()` (not `get_account_with_fixed_root()`) is used when
-    /// reading from the frozen canonical bank inside `handle_frozen_bank`. The
-    /// `_with_fixed_root` variant panics when called from off-chain threads because
-    /// the AccountsDb root may not be fixed at the moment this engine thread reads.
-    /// `get_account()` uses `LoadHint::Unspecified` which is safe from any thread.
-    speculative_snapshot: HashMap<Slot, HashMap<Pubkey, AccountSharedData>>,
     /// Pool addresses detected by the bridge's graduation detector (Phase 1) that
-    /// are waiting for their creation transaction to be confirmed by a
-    /// `SpeculativeAccountUpdate` (Phase 2).
+    /// are waiting for their creation transaction to be confirmed by a committed
+    /// `MevExecutedBatch` (Phase 2).
     ///
     /// When the bridge sees a pool-creation instruction, it sends a `DetectedPool`
-    /// to the engine before the execute() call for the same batch.  The engine
-    /// stores it here.  When a `SpeculativeAccountUpdate` later arrives with that
-    /// pool address in its accounts map, it means execute() applied the creation
-    /// transaction to the speculative bank — the pool now exists in the bank's write
-    /// cache.  The engine then calls `handle_pool_graduation` to integrate the pool
-    /// into the appropriate arb graph.
+    /// here before the shredstream entry is processed further.  The engine stores it
+    /// in this map.  When a `MevExecutedBatch` arrives that includes the pool address
+    /// among the committed accounts, Phase 2 fires: the pool is parsed from the bank
+    /// and integrated into the appropriate arb graph.
     ///
-    /// Entries for failed transactions are cleared by the dead-slot handler: when
-    /// canonical replay rejects a slot, all `DetectedPool` entries whose `slot`
-    /// field matches the dead slot are swept out.  This bounds the map to at most
-    /// one slot's worth of unconfirmed pool creations and prevents indefinite
-    /// accumulation of garbage from transactions that will never land.
+    /// Entries for failed or dead-slot transactions are swept on receipt of the
+    /// corresponding `dead_slot_rx` message.  Bounded by `MAX_PENDING_READY` to
+    /// prevent adversarial pool-creation spam from growing the map unboundedly.
     ///
-    /// Bounded by `MAX_PENDING_READY` to prevent adversarial pool-creation spam
-    /// from growing the map unboundedly.
-    pending_ready: HashMap<Pubkey, DetectedPool>,
+    /// FxHashMap is used for consistency with `account_to_mint` and `mint_states`;
+    /// the map is probed on every committed account key lookup.
+    pending_ready: FxHashMap<Pubkey, DetectedPool>,
 }
 
 impl MevEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        update_rx: Receiver<SpeculativeAccountUpdate>,
-        speculative_update_tx: crossbeam_channel::Sender<SpeculativeAccountUpdate>,
+        mev_batch_rx: Receiver<MevExecutedBatch>,
         bank_rx: Receiver<Arc<Bank>>,
         dead_slot_rx: Receiver<Slot>,
         bank_forks: Arc<RwLock<BankForks>>,
-        speculative_executor: Arc<SpeculativeSlotExecutor>,
         wallet: Arc<Keypair>,
         lut_manager: Arc<LutManager>,
         rpc_client: Arc<RpcClient>,
         base_priority_fee: u64,
         min_profit_lamports: u64,
         validation_mode: bool,
-        speculative_accuracy_check: bool,
         shredstream_url: String,
         mint_pool_data: Vec<Arc<MintPoolData>>,
     ) -> Self {
-        let canonical_bank: Arc<RwLock<Option<Arc<Bank>>>> = Arc::new(RwLock::new(None));
         let simulation_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SIMULATIONS));
 
         // Both halves of the graduation channel are stored on the engine. In
@@ -354,8 +216,7 @@ impl MevEngine {
             crossbeam_channel::unbounded::<Slot>();
 
         let mut engine = Self {
-            update_rx,
-            speculative_update_tx,
+            mev_batch_rx,
             bank_rx,
             dead_slot_rx,
             bridge_dead_slot_tx,
@@ -363,19 +224,16 @@ impl MevEngine {
             graduation_rx,
             graduation_tx: Some(graduation_tx),
             bank_forks,
-            speculative_executor,
             wallet,
             lut_manager,
             rpc_client,
             base_priority_fee,
             min_profit_lamports,
             validation_mode,
-            speculative_accuracy_check,
             shredstream_url,
             simulation_semaphore,
-            canonical_bank,
-            mint_states: HashMap::new(),
-            account_to_mint: HashMap::new(),
+            mint_states: FxHashMap::default(),
+            account_to_mint: FxHashMap::default(),
             pending_executor_starts: Vec::new(),
             // Initialised as an empty Vec. The shredstream bridge does not start
             // until run_async, so nothing reads this field while the registration
@@ -383,12 +241,7 @@ impl MevEngine {
             // ArcSwap in a single O(n) pass after every mint has been registered
             // via register_mint_startup — see the comment after the loop.
             cached_accounts_to_watch: Arc::new(ArcSwap::from(Arc::new(Vec::new()))),
-            slot_timing: HashMap::new(),
-            // The snapshot map starts empty. Entries are added only when
-            // speculative_accuracy_check is true and a batch carries at least one
-            // changed account. Tick-only batches never cause an allocation here.
-            speculative_snapshot: HashMap::new(),
-            pending_ready: HashMap::new(),
+            pending_ready: FxHashMap::default(),
         };
 
         for pool_data in mint_pool_data {
@@ -399,10 +252,10 @@ impl MevEngine {
         // every registered mint maps to exactly one mint pubkey, making it the
         // correct, deduplicated source of truth for the complete account watch list.
         // A single O(n) pass over its keys builds the Vec the shredstream bridge
-        // reads on every entry batch to decide which account writes to forward as
-        // SpeculativeAccountUpdates. Building the Vec once here — after all
-        // registrations are complete — avoids the O(n²) cost of cloning and
-        // rebuilding the growing Vec inside each register_mint_startup call.
+        // reads on every entry batch to decide which account writes to forward.
+        // Building the Vec once here — after all registrations are complete —
+        // avoids the O(n²) cost of cloning and rebuilding the growing Vec inside
+        // each register_mint_startup call.
         let all_accounts: Vec<Pubkey> = engine.account_to_mint.keys().copied().collect();
         engine.cached_accounts_to_watch.store(Arc::new(all_accounts));
 
@@ -438,23 +291,28 @@ impl MevEngine {
         ));
 
         let tracked_accounts = {
-            let g = arb_graph.read().unwrap();
+            // Recover from a poisoned lock: if a previous holder panicked while
+            // the write lock was held, the guard is still valid and the data is
+            // still usable — the panic already unwound that writer's stack.
+            let g = arb_graph.read().unwrap_or_else(|p| p.into_inner());
             g.all_tracked_accounts()
         };
-
-        let (pool_update_tx, pool_update_rx) = broadcast::channel(1024);
-
-        // Wrap pool_data in an ArcSwap so the engine can atomically update it
         // when a graduation event brings a new pool for this mint. Both MintState
         // and ArbitrageExecutor hold Arc<ArcSwap<...>> clones pointing to the same
         // ArcSwap. The engine calls store() on graduation (rare write); the executor
         // calls load() on every simulation (frequent lock-free read).
         let pool_data_swap = Arc::new(ArcSwap::from(pool_data));
 
+        // Each registered mint owns a dedicated broadcast channel. Capacity 1024
+        // matches the startup path: the oldest event is silently evicted when a
+        // lagging receiver falls behind rather than blocking the engine. The sender
+        // half is stored in MintState; the receiver half is handed to the executor
+        // so it can be driven by the pending_executor_starts mechanism in run_async.
+        let (pool_update_tx, pool_update_rx) = broadcast::channel(1024);
+
         let executor = Arc::new(ArbitrageExecutor::new(
             Arc::clone(&arb_graph),
             Arc::clone(&pool_data_swap),
-            Arc::clone(&self.canonical_bank),
             Arc::clone(&self.wallet),
             Arc::clone(&self.lut_manager),
             Arc::clone(&self.rpc_client),
@@ -478,27 +336,18 @@ impl MevEngine {
         // path (register_mint runs at startup, not per slot) so the Vec rebuild cost
         // is irrelevant to steady-state latency.
         //
-        // The previously used `new_vec.contains(account)` is O(n) per call. With
-        // hundreds of mints each with dozens of accounts, the total cost at startup
-        // is O(n_mints × n_accounts²) — quadratic in the account count. Instead,
-        // a HashSet is built once from the current Vec for O(1) membership testing,
-        // reducing the total insertion cost to O(n_new_accounts) per mint.
+        // A HashSet is built from the existing Vec to provide O(1) membership
+        // testing — Vec::contains is O(n) and becomes O(n²) when called for
+        // each account over a large existing list.
         {
             let current = self.cached_accounts_to_watch.load();
-            // Clone the current Vec once to produce new_vec.  A single clone is
-            // necessary because ArcSwap::load() returns a Guard (a shared borrow)
-            // and we need an owned Vec to extend.  Building `existing` from
-            // new_vec.iter() (rather than from a second (**current).iter() call)
-            // eliminates the second read of the Guard and keeps the allocation
-            // count at one per register_mint call.
             let mut new_vec: Vec<Pubkey> = (**current).clone();
-            // Build the dedup set from the already-owned new_vec, not by cloning
-            // current a second time.  Both reads refer to the same data but the
-            // previous version cloned the underlying Vec twice.
-            let existing: std::collections::HashSet<Pubkey> =
-                new_vec.iter().copied().collect();
+            // FxHashSet provides O(1) membership tests for the deduplication scan.
+            // The set is built from the existing Vec once per register_mint call —
+            // this is off the hot path (startup / rare graduation) so the
+            // allocation is not a concern.
+            let existing: FxHashSet<Pubkey> = new_vec.iter().copied().collect();
             for account in &tracked_accounts {
-                // O(1) HashSet lookup — no linear scan of the growing Vec.
                 if !existing.contains(account) {
                     new_vec.push(*account);
                 }
@@ -534,20 +383,6 @@ impl MevEngine {
     /// `account_to_mint` builds the full deduplicated account Vec and stores it
     /// atomically into `cached_accounts_to_watch` — one allocation for all mints
     /// combined, rather than one allocation per mint.
-    ///
-    /// To understand why the incremental approach is O(n²): each call to the
-    /// equivalent block in `register_mint` loads the current Vec (which grows by ~3
-    /// entries per call), clones the entire thing, builds a HashSet from the clone
-    /// to detect duplicates, appends the new accounts, and stores a fresh Arc.
-    /// By the time the 2.14 millionth mint is registered the Vec holds roughly
-    /// 6.4 million entries and each iteration copies ~200 MB of pubkey data. The
-    /// cumulative memory traffic across all registrations reaches into the hundreds
-    /// of terabytes, turning what should be a linear initialisation into an
-    /// 18-hour blocking operation on the validator's startup thread.
-    ///
-    /// [`register_mint`] is preserved unchanged for runtime graduation calls, where
-    /// the bridge is already active and `cached_accounts_to_watch` must reflect
-    /// newly discovered vault accounts within the same slot they are detected.
     fn register_mint_startup(&mut self, pool_data: Arc<MintPoolData>) {
         let mint = pool_data.mint;
         if self.mint_states.contains_key(&mint) {
@@ -560,7 +395,8 @@ impl MevEngine {
         ));
 
         let tracked_accounts = {
-            let g = arb_graph.read().unwrap();
+            // Recover from a poisoned lock — see register_mint for the rationale.
+            let g = arb_graph.read().unwrap_or_else(|p| p.into_inner());
             g.all_tracked_accounts()
         };
 
@@ -571,7 +407,6 @@ impl MevEngine {
         let executor = Arc::new(ArbitrageExecutor::new(
             Arc::clone(&arb_graph),
             Arc::clone(&pool_data_swap),
-            Arc::clone(&self.canonical_bank),
             Arc::clone(&self.wallet),
             Arc::clone(&self.lut_manager),
             Arc::clone(&self.rpc_client),
@@ -583,10 +418,10 @@ impl MevEngine {
         self.pending_executor_starts.push((executor, pool_update_rx));
 
         // account_to_mint is the reverse index the engine queries on every
-        // SpeculativeAccountUpdate to route pool-account writes to the correct
-        // executor. Populating it here is the only mutation that matters during
-        // startup — it is the source of truth from which cached_accounts_to_watch
-        // is built once in MevEngine::new after all mints are registered.
+        // MevExecutedBatch to route pool-account writes to the correct executor.
+        // Populating it here is the only mutation that matters during startup —
+        // it is the source of truth from which cached_accounts_to_watch is built
+        // once in MevEngine::new after all mints are registered.
         for account in &tracked_accounts {
             self.account_to_mint.insert(*account, mint);
         }
@@ -649,39 +484,31 @@ impl MevEngine {
         // The shredstream bridge is wrapped so that its exit is always logged.
         // When the bridge exits — whether due to a permanent gRPC disconnect, a
         // network partition, or a panic — the engine's select loop continues
-        // draining bank_rx and dead_slot_rx but receives no further speculative
-        // updates. Without this log the operator has no way to distinguish a silent
-        // bridge failure from a period where no tracked pools happened to be touched.
+        // draining bank_rx and dead_slot_rx but receives no further graduation
+        // detections.  Without this log the operator has no way to distinguish a
+        // silent bridge failure from a period where no tracked pools were touched.
         {
-            let speculative_executor = Arc::clone(&self.speculative_executor);
-            let bank_forks = Arc::clone(&self.bank_forks);
-            let cached_accounts_to_watch = Arc::clone(&self.cached_accounts_to_watch);
-            let speculative_update_tx = self.speculative_update_tx.clone();
             let shredstream_url = self.shredstream_url.clone();
-            // Take the dedicated bridge dead-slot receiver. This receiver is the
-            // engine-to-bridge forwarding channel: every dead slot the engine receives
-            // from replay_stage via dead_slot_rx is echoed here, giving the bridge a
-            // complete copy of every event without sharing the underlying queue with the
-            // engine. Sharing a queue (the old clone() approach) caused both endpoints
-            // to consume from the same channel, splitting events non-deterministically.
+            // Take the dedicated bridge dead-slot receiver. The engine echoes every
+            // dead slot it receives from replay_stage through this channel, giving the
+            // bridge a complete copy of every event without splitting the underlying
+            // queue (the old clone() approach caused non-deterministic message splitting
+            // because both endpoints consumed from the same channel).
             let dead_slot_rx_for_bridge = self
                 .bridge_dead_slot_rx
                 .take()
                 .expect("bridge_dead_slot_rx taken twice — run_async called more than once");
             tokio::spawn(async move {
-                crate::mev::shredstream_bridge::run_speculative_executor(
-                    speculative_executor,
-                    bank_forks,
-                    cached_accounts_to_watch,
-                    speculative_update_tx,
+                crate::mev::shredstream_bridge::run_graduation_bridge(
                     graduation_tx,
                     dead_slot_rx_for_bridge,
                     shredstream_url,
                 )
                 .await;
                 error!(
-                    "MevEngine: shredstream bridge task exited — speculative execution \
-                     has stopped. No further MEV opportunities will be detected until \
+                    "MevEngine: shredstream graduation bridge task exited — new pool \
+                     detection has stopped. The engine continues running against \
+                     existing pools but will not detect newly created ones until \
                      the validator is restarted."
                 );
             });
@@ -704,28 +531,11 @@ impl MevEngine {
 
         loop {
             crossbeam_channel::select! {
-                recv(self.update_rx) -> msg => {
+                recv(self.mev_batch_rx) -> msg => {
                     match msg {
-                        Ok(update) => {
-                            if update.is_correction {
-                                // Correction updates arrive from confirm_slot() after the
-                                // canonical replay pipeline has verified a parent slot and
-                                // re-executed all stored child-slot batches against it.
-                                // The accounts map in a correction holds the TOTAL effect
-                                // of every batch for that child slot, measured from the
-                                // canonical parent — it replaces all prior speculative
-                                // state for that slot, it does not accumulate on top of it.
-                                self.handle_correction_update(update);
-                            } else {
-                                // Incremental updates arrive from execute() — one per
-                                // shredstream batch delivery. Each carries only the accounts
-                                // that changed during that specific delivery. The caller
-                                // accumulates these as the slot progresses.
-                                self.handle_speculative_update(update);
-                            }
-                        }
+                        Ok(batch) => self.handle_mev_batch(batch),
                         Err(_) => {
-                            info!("MevEngine: speculative update channel closed — shutting down");
+                            info!("MevEngine: mev_batch channel closed — shutting down");
                             break;
                         }
                     }
@@ -743,59 +553,24 @@ impl MevEngine {
 
                 recv(self.dead_slot_rx) -> msg => {
                     // When the canonical replay pipeline marks a slot as dead, any
-                    // speculative banks built on top of that slot's entries become
-                    // permanently invalid.  `discard_slot` atomically evicts the dead
-                    // slot and every speculative descendant from the internal `slot_banks`
-                    // map.  Without eviction those invalid banks would persist and the engine
-                    // would simulate arb against account state the network has rejected.
+                    // pool-creation transactions that were part of that slot will never
+                    // land on-chain.  Sweep pending_ready for all entries that belong
+                    // to the dead slot so they cannot produce false-positive graduation
+                    // events when future batches touch the same pool address.
                     if let Ok(dead_slot) = msg {
-                        // Remove the timing record. A dead slot will never receive a
-                        // canonical freeze signal, so without removal the entry leaks.
-                        if let Some(timing) = self.slot_timing.remove(&dead_slot) {
-                            warn!(
-                                "MevEngine: slot {} declared dead after {} speculative \
-                                 batch(es) and {} event(s) broadcast — all speculative \
-                                 state condemned",
-                                dead_slot,
-                                timing.batch_count,
-                                timing.events_broadcast,
-                            );
-                        }
-
-                        // Remove the accuracy snapshot for this slot. The slot was
-                        // rejected by canonical replay — there is no frozen canonical
-                        // bank for it and therefore no ground truth to compare against.
-                        if self.speculative_accuracy_check {
-                            self.speculative_snapshot.remove(&dead_slot);
-                        }
-
-                        // Sweep pending_ready entries that belong to this dead slot.
-                        // Pool creation transactions that were part of a dead slot will
-                        // never be confirmed on-chain. Keeping their DetectedPool entries
-                        // would cause them to match against SpeculativeAccountUpdates from
-                        // future slots that happen to touch the same address — a false
-                        // positive that would attempt to integrate a pool that does not
-                        // actually exist in canonical state.
                         self.pending_ready.retain(|_, v| v.slot != dead_slot);
-
-                        let condemned = self.speculative_executor.discard_slot(dead_slot);
-                        if !condemned.is_empty() {
-                            info!(
-                                "MevEngine: evicted dead slot {} and {} speculative \
-                                 descendant(s)",
-                                dead_slot,
-                                condemned.len().saturating_sub(1),
-                            );
-                        }
 
                         // Forward the dead slot to the bridge task so it can sweep its
                         // per-DEX pending maps (pending_clmm, pending_whirlpool,
-                        // pending_dlmm). The bridge calls detector.clear_dead_slot()
-                        // to prevent stale entries from accumulating and crowding out
-                        // genuine new-pool detections. The send is best-effort: if the
-                        // bridge has exited (channel disconnected) the error is silently
-                        // dropped — a disconnected bridge has already stopped processing.
+                        // pending_dlmm). The send is best-effort: if the bridge has
+                        // exited (channel disconnected) the error is silently dropped.
                         let _ = self.bridge_dead_slot_tx.send(dead_slot);
+
+                        info!(
+                            "MevEngine: slot {} declared dead — pending_ready swept, \
+                             bridge notified",
+                            dead_slot
+                        );
                     }
                 }
 
@@ -803,24 +578,18 @@ impl MevEngine {
                     // Phase 1 of the two-phase graduation pipeline completed in the bridge.
                     // The bridge detected a pool-creation instruction in the raw entry stream
                     // and sent the pool address, mints, and DEX type here. The engine stores
-                    // this in pending_ready. When a SpeculativeAccountUpdate arrives that
-                    // contains this pool address, it means execute() applied the creation
-                    // transaction to the speculative bank — Phase 2 fires to integrate the
-                    // pool into the arb graph.
+                    // this in pending_ready. When a MevExecutedBatch arrives that contains
+                    // this pool address among committed accounts, Phase 2 fires to integrate
+                    // the pool into the arb graph using the bank from that batch.
                     if let Ok(detected) = msg {
                         // Skip if this pool is already tracked — a second graduation event
-                        // for an already-registered pool address is redundant. The bridge
-                        // may send duplicates when a pool's accounts appear in multiple
-                        // consecutive entry batches. Using `continue` here stays inside the
-                        // select! loop; `return` would exit run_async() entirely and shut
-                        // down the whole engine.
+                        // for an already-registered pool address is redundant.
                         if self.account_to_mint.contains_key(&detected.pool_address) {
                             continue;
                         }
 
                         // Enforce the cap to prevent adversarial pool-creation spam from
-                        // growing the map without bound. Dropped events are recoverable:
-                        // the pool will be discovered by the startup scan on the next restart.
+                        // growing the map without bound.
                         if self.pending_ready.len() < MAX_PENDING_READY {
                             self.pending_ready.insert(detected.pool_address, detected);
                         } else {
@@ -838,86 +607,31 @@ impl MevEngine {
         info!("MevEngine: event loop exited");
     }
 
-    /// Route an incremental speculative account update batch to the correct
-    /// per-mint executor.
+    /// Route a committed transaction batch to the correct per-mint executors.
     ///
-    /// Every `MevPoolUpdateEvent` produced here carries `from_speculative_execution:
-    /// true` and `is_correction: false`. The downstream `ArbitrageExecutor` treats
-    /// these events as incremental deltas — each one reports only what changed
-    /// during this specific shredstream batch delivery. The executor accumulates
-    /// them as the slot progresses.
-    fn handle_speculative_update(&mut self, update: SpeculativeAccountUpdate) {
-        let slot = update.slot;
+    /// Called every time `execute_batch()` in `blockstore_processor.rs` commits a
+    /// group of transactions to the canonical replay bank mid-slot.  The bank
+    /// carried in `batch` reflects ALL writes from every `Ok` commit result in this
+    /// batch and is immediately usable for simulation — no further waiting for slot
+    /// completion or `bank.freeze()`.
+    ///
+    /// For every account that was touched by a committed transaction and that maps
+    /// to a tracked mint, a `MevPoolUpdateEvent` is broadcast to that mint's
+    /// `ArbitrageExecutor`.  The event carries the exact bank reference so the
+    /// executor can call `simulate_transaction_unchecked` directly against it.
+    fn handle_mev_batch(&mut self, batch: MevExecutedBatch) {
+        let slot = batch.slot;
+        let bank = &batch.bank;
+        let blockhash = bank.last_blockhash();
 
-        // First timing borrow window: create-or-update the slot's timing record and
-        // increment the batch counter, then immediately release the borrow.
-        //
-        // This MUST be a separate scope from the account-processing loop below.
-        // `entry().or_insert_with()` returns a `&mut SlotTiming` that mutably borrows
-        // `self.slot_timing`. Later in this function, `self.handle_pool_graduation()`
-        // is called, which takes `&mut self` — requiring exclusive access to all of
-        // self including self.slot_timing. If `timing` were still live at that point,
-        // the two borrows would overlap, producing a compile error. The explicit scope
-        // ensures the borrow ends here, before any `&mut self` method is invoked.
-        {
-            let timing = self.slot_timing.entry(slot).or_insert_with(|| {
-                info!(
-                    "MevEngine: first speculative batch for slot {} ({} changed account(s))",
-                    slot,
-                    update.accounts.len(),
-                );
-                SlotTiming {
-                    first_speculative_at: Instant::now(),
-                    batch_count: 0,
-                    events_broadcast: 0,
-                }
-            });
-            timing.batch_count += 1;
-        } // timing borrow released — self is now fully available for &mut self calls
-
-        // When accuracy checking is enabled, record the latest speculative value
-        // for every account this batch touched. The guard on accounts.is_empty()
-        // prevents allocating an inner HashMap for tick-only batches that carry
-        // no account changes — a tick advances the slot's PoH chain but does not
-        // modify any account state, so there is nothing meaningful to snapshot.
-        if self.speculative_accuracy_check && !update.accounts.is_empty() {
-            let slot_snapshot = self
-                .speculative_snapshot
-                .entry(slot)
-                .or_insert_with(HashMap::new);
-            for (pubkey, account_data) in &update.accounts {
-                slot_snapshot.insert(*pubkey, account_data.clone());
-            }
-        }
-
-        let speculative_bank = match self.speculative_executor.get_slot_bank(slot) {
-            Some(bank) => bank,
-            None => {
-                warn!(
-                    "MevEngine: no speculative bank for slot {} \
-                     (already confirmed or discarded) — dropping {} update(s)",
-                    slot,
-                    update.accounts.len()
-                );
-                return;
-            }
-        };
-
-        let blockhash = speculative_bank.last_blockhash();
-        let mut events_sent: u32 = 0;
-
-        // Drain any graduation events that arrived for this batch BEFORE scanning
-        // the account map. The bridge sends graduation_tx before speculative_update_tx
-        // for the same entry batch, so every DetectedPool for this batch is already
-        // in graduation_rx by the time this update arrives here. The crossbeam select!
-        // loop may have dispatched the update_rx arm before the graduation_rx arm due
-        // to non-deterministic arm selection — this drain catches those in-flight
-        // graduation events before the per-account routing below checks pending_ready.
-        //
-        // Hoisting the drain here (once per batch) instead of inside the None arm of
-        // the account loop (once per untracked account per batch) eliminates O(n_untracked)
-        // try_recv syscalls on the hot path. The drain is bounded by the number of
-        // new-pool detections in the batch — typically zero.
+        // Drain any graduation events that arrived for this batch before scanning
+        // the account map. The bridge sends graduation_tx before the entry that
+        // produced these commits is fully processed, so every DetectedPool for
+        // this batch is typically already in graduation_rx by the time this batch
+        // arrives here. Absorbing them first ensures that when the per-account loop
+        // below encounters an untracked address that is in pending_ready, the
+        // pending_ready entry was inserted BEFORE the loop rather than being missed
+        // because select! dispatched mev_batch_rx before graduation_rx for this pair.
         while let Ok(g) = self.graduation_rx.try_recv() {
             if !self.account_to_mint.contains_key(&g.pool_address) {
                 if self.pending_ready.len() < MAX_PENDING_READY {
@@ -926,347 +640,130 @@ impl MevEngine {
             }
         }
 
-        // `_account_data` is intentionally unused in the event construction below.
-        // MevPoolUpdateEvent attaches the full speculative_bank rather than the
-        // individual account delta — the executor reads whichever accounts it needs
-        // directly from the bank via get_account() during simulation. The delta
-        // in update.accounts is used only for routing (which pool was touched) and
-        // for the accuracy snapshot, both of which use pool_address as the key.
-        for (pool_address, _account_data) in &update.accounts {
-            match self.account_to_mint.get(pool_address) {
-                Some(mint) => {
-                    let state = match self.mint_states.get(mint) {
-                        Some(s) => s,
-                        None => continue,
-                    };
+        // Walk the committed transactions and collect every account address that
+        // a successfully committed transaction wrote.  `TransactionCommitResult`
+        // does not carry the write-set directly — but the bank has already applied
+        // all writes, so we use the transaction's static account keys as the
+        // routing signal: if a tracked pool address appears as a writable account
+        // in any successfully committed transaction, the pool's state has changed.
+        //
+        // This is a routing heuristic, not a precise write-set: a transaction that
+        // touches a pool account but produces no actual state change (e.g. a failed
+        // inner instruction that reverts) will still trigger a simulation.  That is
+        // acceptable — the simulation itself will observe no profitable price
+        // discrepancy and return without submitting.  A false negative (missing a
+        // real state change) would be worse than a false positive.
+        use solana_svm::transaction_commit_result::TransactionCommitResultExtensions;
+        let mut events_sent: u32 = 0;
 
-                    let event = MevPoolUpdateEvent {
-                        pool_address: *pool_address,
-                        speculative_bank: Some(Arc::clone(&speculative_bank)),
-                        blockhash,
-                        from_speculative_execution: true,
-                        is_correction: false,
-                    };
+        for (commit_result, tx) in batch.commit_results.iter().zip(batch.transactions.iter()) {
+            if !commit_result.was_committed() {
+                continue;
+            }
 
-                    match state.pool_update_tx.send(event) {
-                        Ok(_) => {
-                            events_sent += 1;
+            for account_key in tx.message().account_keys().iter() {
+                match self.account_to_mint.get(account_key) {
+                    Some(mint) => {
+                        let state = match self.mint_states.get(mint) {
+                            Some(s) => s,
+                            None => continue,
+                        };
+
+                        let event = MevPoolUpdateEvent {
+                            pool_address: *account_key,
+                            bank: Arc::clone(bank),
+                            blockhash,
+                        };
+
+                        match state.pool_update_tx.send(event) {
+                            Ok(_) => { events_sent += 1; }
+                            Err(e) => {
+                                // A send error on a broadcast channel means there are no
+                                // active receivers — all ArbitrageExecutor tasks for this
+                                // mint have exited. This is unusual and worth logging.
+                                warn!(
+                                    "MevEngine: pool_update_tx send error for mint {}: {}",
+                                    mint, e
+                                );
+                            }
                         }
-                        Err(e) => {
-                            // A send error on a broadcast channel means there are no
-                            // active receivers — all ArbitrageExecutor tasks for this
-                            // mint have exited. This is unusual and worth logging.
-                            warn!(
-                                "MevEngine: pool_update_tx send error for mint {}: {}",
-                                mint, e
-                            );
+                    }
+
+                    None => {
+                        // Check whether this untracked account is a newly created pool
+                        // address that Phase 1 registered in pending_ready. If so, Phase
+                        // 2 fires to integrate it into the arb graph using the bank that
+                        // just committed its creation transaction — the freshest possible
+                        // state, available immediately after the creation succeeded.
+                        if let Some(detected) = self.pending_ready.remove(account_key) {
+                            self.handle_pool_graduation(detected, bank);
                         }
                     }
                 }
-
-                None => {
-                    // The pre-loop graduation_rx drain (above) has already absorbed any
-                    // Phase 1 detections for this batch into pending_ready. Check here
-                    // whether this untracked account is a newly created pool address that
-                    // Phase 1 registered. If so, Phase 2 fires to integrate it into the
-                    // arb graph using the speculative bank that just executed the creation
-                    // transaction. Accounts that are neither tracked nor in pending_ready
-                    // belong to programs, sysvars, or other state the engine ignores.
-                    if let Some(detected) = self.pending_ready.remove(pool_address) {
-                        self.handle_pool_graduation(detected, &speculative_bank);
-                    }
-                }
             }
         }
 
-        // Second timing borrow window: record how many pool-update events were
-        // broadcast to executors for this batch. A new get_mut is needed because
-        // the first timing borrow was explicitly dropped above. The engine is a
-        // single-threaded select loop, so no other code path removes this entry
-        // between the two windows — if let Some is used defensively rather than
-        // unwrap, but the None arm is unreachable in practice.
-        if let Some(timing) = self.slot_timing.get_mut(&slot) {
-            timing.events_broadcast += events_sent;
-        }
-    }
-
-    /// Route a canonical rebase correction to the correct per-mint executor.
-    ///
-    /// Correction updates differ fundamentally from incremental speculative updates:
-    /// the accounts map holds the TOTAL accumulated effect of every batch for the
-    /// child slot, re-executed against the now-verified canonical parent.  The
-    /// downstream `ArbitrageExecutor` must REPLACE its prior cached state for this
-    /// slot with exactly what this correction contains, rather than accumulating it
-    /// on top of previously delivered incremental deltas.
-    ///
-    /// Every `MevPoolUpdateEvent` produced here carries `is_correction: true` so
-    /// the executor can identify the replacement semantic without inspecting any
-    /// other field.
-    fn handle_correction_update(&mut self, update: SpeculativeAccountUpdate) {
-        let slot = update.slot;
-
-        let speculative_bank = match self.speculative_executor.get_slot_bank(slot) {
-            Some(bank) => bank,
-            None => {
-                // The slot was evicted between the correction being produced and
-                // this dispatch. Nothing to correct — the executor has no state for
-                // this slot anyway.
-                return;
-            }
-        };
-
-        let blockhash = speculative_bank.last_blockhash();
-
-        // When a correction arrives the accuracy snapshot for this slot must be
-        // REPLACED entirely, not merged with prior incremental deltas.
-        //
-        // Case A — non-empty accounts map: the correction contains the total
-        //   re-executed state delta from the canonical parent.  Replace whatever
-        //   pre-rebase snapshot was stored with exactly this new map.
-        //
-        // Case B — empty accounts map: re-execution produced no changes to any
-        //   watched account.  The correct ground-truth for this slot is therefore
-        //   "no watched-account changes" — the pre-rebase incremental deltas are
-        //   wrong and must be removed.  If they are left in place, handle_frozen_bank
-        //   will compare them against the canonical bank and record false mismatches
-        //   in the accuracy log, making the metric unreliable.
-        if self.speculative_accuracy_check {
-            if update.accounts.is_empty() {
-                // Empty correction: the slot re-executed cleanly but touched no
-                // watched accounts.  Remove any stale snapshot so the accuracy
-                // comparison at freeze time finds nothing to compare against.
-                self.speculative_snapshot.remove(&slot);
-            } else {
-                let mut new_snapshot = HashMap::with_capacity(update.accounts.len());
-                for (pubkey, account_data) in &update.accounts {
-                    new_snapshot.insert(*pubkey, account_data.clone());
-                }
-                self.speculative_snapshot.insert(slot, new_snapshot);
-            }
-        }
-
-        for (pool_address, _account_data) in &update.accounts {
-            let Some(mint) = self.account_to_mint.get(pool_address) else {
-                continue;
-            };
-            let Some(state) = self.mint_states.get(mint) else {
-                continue;
-            };
-
-            // is_correction: true — the executor must replace all prior speculative
-            // state it holds for this slot. from_speculative_execution: false —
-            // the re-execution used a canonically verified parent bank, so this
-            // result carries only the child slot's own unverified uncertainty.
-            let event = MevPoolUpdateEvent {
-                pool_address: *pool_address,
-                speculative_bank: Some(Arc::clone(&speculative_bank)),
-                blockhash,
-                from_speculative_execution: false,
-                is_correction: true,
-            };
-
-            if let Err(e) = state.pool_update_tx.send(event) {
-                warn!(
-                    "MevEngine: correction pool_update_tx send error for mint {}: {}",
-                    mint, e
-                );
-            }
+        if events_sent > 0 {
+            debug!(
+                "MevEngine: slot {} batch committed — {} pool-update event(s) broadcast",
+                slot, events_sent
+            );
         }
     }
 
     /// Handle a frozen canonical bank delivered directly by `ReplayStage`.
     ///
-    /// `ReplayStage` calls `bank.freeze()` and then sends the `Arc<Bank>` directly
-    /// through this channel before doing anything else.  The bank is already
-    /// immutable by the time it arrives here — `freeze()` sets an internal atomic
-    /// flag that prevents further writes and commits the bank hash to the
-    /// `bank.hash` field.
-    ///
-    /// The engine performs two operations with the frozen bank:
-    ///
-    /// 1. Stores it as the canonical fallback in `canonical_bank` so that
-    ///    `ArbitrageExecutor` instances have a valid bank to simulate against
-    ///    when no speculative bank is available.
-    ///
-    /// 2. Calls `confirm_slot` on the `SpeculativeSlotExecutor`.  This function
-    ///    rebases all speculative child banks that were built on speculative state
-    ///    for this slot onto the now-verified canonical parent, producing
-    ///    "correction updates" — deltas between what the speculative execution
-    ///    predicted and what the canonical bank actually contains.
+    /// At this point the slot is complete and the bank hash is finalized.  The
+    /// engine uses the frozen bank only as a fallback for graduation processing:
+    /// if a pool-creation transaction was the last transaction in a slot, its
+    /// creation may have arrived via `handle_mev_batch` already.  This handler
+    /// ensures that any pending graduation that was not triggered mid-slot is
+    /// resolved once the slot is fully committed.
     fn handle_frozen_bank(&mut self, bank: Arc<Bank>) {
         let slot = bank.slot();
 
-        // Measure the speculative lead time: how far ahead of canonical replay
-        // the engine ran for this slot. Removing the entry here (rather than
-        // just reading it) is intentional — each slot is measured exactly once,
-        // at canonical freeze, and the map entry is not needed after that.
-        let (lead_ms, batch_count, events_broadcast) =
-            if let Some(timing) = self.slot_timing.remove(&slot) {
-                let lead_us = timing.first_speculative_at.elapsed().as_micros();
-                (lead_us / 1000, timing.batch_count, timing.events_broadcast)
-            } else {
-                (0u128, 0u32, 0u32)
-            };
-
-        // When accuracy checking is enabled, compare the accumulated speculative
-        // predictions for this slot against the canonical ground truth now held in
-        // the frozen bank.
-        //
-        // `bank.get_account()` uses `load_without_fixed_root` internally
-        // (LoadHint::Unspecified), which is safe to call from this off-chain MEV
-        // engine thread. The alternative `get_account_with_fixed_root()` must NOT
-        // be used here — it asserts that the AccountsDb root is fixed at call time,
-        // which is only guaranteed when called from BankingStage or ReplayStage
-        // threads.
-        //
-        // A zero-lamport account in the speculative snapshot means a transaction
-        // closed that account. AccountsDb does not store zero-lamport accounts after
-        // freeze — bank.get_account() returns None for them. Both representations
-        // (speculative lamports=0 and canonical None) mean the account does not
-        // exist — treating this as a mismatch would produce false positives.
-        let (accuracy_matched, accuracy_total) = if self.speculative_accuracy_check {
-            if let Some(speculative_accounts) = self.speculative_snapshot.remove(&slot) {
-                let mut matched: u32 = 0;
-                let mut mismatched: u32 = 0;
-
-                for (pubkey, speculative_value) in &speculative_accounts {
-                    match bank.get_account(pubkey) {
-                        Some(ref canonical) if canonical == speculative_value => {
-                            matched += 1;
-                        }
-                        Some(canonical) => {
-                            mismatched += 1;
-                            info!(
-                                "MevEngine: ACCURACY slot={} account={} MISMATCH \
-                                 speculative_lamports={} canonical_lamports={}",
-                                slot,
-                                pubkey,
-                                speculative_value.lamports(),
-                                canonical.lamports(),
-                            );
-                        }
-                        None => {
-                            if speculative_value.lamports() == 0 {
-                                matched += 1;
-                            } else {
-                                mismatched += 1;
-                                info!(
-                                    "MevEngine: ACCURACY slot={} account={} MISMATCH \
-                                     speculative_lamports={} canonical=account does not exist",
-                                    slot,
-                                    pubkey,
-                                    speculative_value.lamports(),
-                                );
-                            }
-                        }
-                    }
+        // Drain any graduation events that are still queued and attempt to match
+        // them against the now-frozen bank. This covers the edge case where the
+        // bridge detected a pool creation in a batch that also happened to be the
+        // final batch of the slot — the graduation event may have arrived in the
+        // channel slightly after the mev_batch for that same creation, causing
+        // pending_ready to be populated after handle_mev_batch already processed
+        // the relevant accounts.
+        while let Ok(g) = self.graduation_rx.try_recv() {
+            if !self.account_to_mint.contains_key(&g.pool_address) {
+                if self.pending_ready.len() < MAX_PENDING_READY {
+                    self.pending_ready.insert(g.pool_address, g);
                 }
-
-                (matched, matched + mismatched)
-            } else {
-                (0u32, 0u32)
-            }
-        } else {
-            (0u32, 0u32)
-        };
-
-        if lead_ms > 0 {
-            if self.speculative_accuracy_check && accuracy_total > 0 {
-                info!(
-                    "MevEngine: slot {} canonical freeze — lead {}ms ({} batch(es), \
-                     {} event(s) broadcast) accuracy={}/{} accounts matched canonical",
-                    slot, lead_ms, batch_count, events_broadcast,
-                    accuracy_matched, accuracy_total,
-                );
-            } else {
-                info!(
-                    "MevEngine: slot {} canonical freeze — lead {}ms ({} batch(es), \
-                     {} event(s) broadcast to executors)",
-                    slot, lead_ms, batch_count, events_broadcast,
-                );
-            }
-        } else {
-            info!(
-                "MevEngine: slot {} canonical freeze — no prior speculative execution \
-                 (leader slot, shredstream gap, or canonical beat shredstream)",
-                slot,
-            );
-        }
-
-        // Update the canonical fallback shared with all ArbitrageExecutor instances.
-        // The write lock is held for exactly one assignment then dropped.
-        {
-            let mut guard = match self.canonical_bank.write() {
-                Ok(g) => g,
-                Err(e) => {
-                    error!(
-                        "MevEngine: canonical_bank RwLock poisoned on slot {}: {}",
-                        slot, e
-                    );
-                    return;
-                }
-            };
-            *guard = Some(Arc::clone(&bank));
-        }
-
-        // Load the current account list with a single atomic pointer read.
-        // ArcSwap::load() returns a Guard that dereferences to &Vec<Pubkey> with no
-        // allocation.  The guard keeps the Vec alive for the duration of confirm_slot.
-        let accounts_guard = self.cached_accounts_to_watch.load();
-        let accounts_snapshot: &[Pubkey] = &*accounts_guard;
-
-        match self.speculative_executor.confirm_slot(
-            slot,
-            bank,
-            &*self.bank_forks,
-            &accounts_snapshot,
-        ) {
-            Ok(correction_updates) => {
-                if !correction_updates.is_empty() {
-                    info!(
-                        "MevEngine: slot {} confirmed — {} child slot(s) rebased onto \
-                         canonical parent (corrections dispatched to executors)",
-                        slot,
-                        correction_updates.len()
-                    );
-                }
-                for update in correction_updates {
-                    self.handle_correction_update(update);
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "MevEngine: confirm_slot {} failed: {:?} — child slot state indeterminate",
-                    slot, e
-                );
             }
         }
 
-        // Prune completed_slots to bound its memory growth. The set accumulates
-        // every confirmed or condemned slot and is never evicted without explicit
-        // pruning. At 2.5 slots per second this is ~216 000 entries per day.
-        //
-        // Pruning at the current root is safe: BankForks.set_root() permanently
-        // removes all banks below the new root, so execute() cannot receive a
-        // shredstream batch for a sub-root slot whose parent resolution would
-        // succeed — Level 3 and 4 return None for pruned parents, and the
-        // resulting ParentBankNotFound causes the caller to drop the batch.
-        // Removing sub-root slots from completed_slots therefore cannot cause any
-        // bank to be re-created. The bank_forks read lock is held for one .root()
-        // call — microseconds — and no other lock is held at this point.
-        {
-            let root = self.bank_forks.read().unwrap().root();
-            self.speculative_executor.prune_completed_before(root);
+        // Attempt graduation for any pool whose creation was detected in this slot
+        // and whose account now exists in the frozen canonical bank.
+        let detected_in_slot: Vec<Pubkey> = self
+            .pending_ready
+            .iter()
+            .filter(|(_, v)| v.slot == slot)
+            .map(|(k, _)| *k)
+            .collect();
+
+        for pool_address in detected_in_slot {
+            if bank.get_account(&pool_address).is_some() {
+                if let Some(detected) = self.pending_ready.remove(&pool_address) {
+                    self.handle_pool_graduation(detected, &bank);
+                }
+            }
         }
+
+        debug!("MevEngine: slot {} canonical freeze processed", slot);
     }
 
     /// Phase 2 of the graduation pipeline.
     ///
-    /// Called when a `SpeculativeAccountUpdate` arrives for a pool address that
-    /// was previously placed in `pending_ready` by the graduation detector's Phase 1
-    /// scan.  At this point `execute()` has already applied the creation transaction
-    /// to the speculative bank — `bank.get_account(pool_address)` will return the
-    /// freshly created pool state account.
+    /// Called when a committed `MevExecutedBatch` (or a frozen canonical bank at
+    /// slot completion) confirms that the pool-creation transaction succeeded.
+    /// At this point `bank.get_account(pool_address)` returns the freshly written
+    /// pool state account — all sub-accounts (vaults, tick arrays, oracles) created
+    /// in the same transaction are also present in the bank.
     ///
     /// ## Known mint path
     ///
@@ -1274,41 +771,32 @@ impl MevEngine {
     /// `ArbitrageExecutor`, the pool is fully integrated:
     ///
     /// 1. `initialize_mint_from_discovered` reads the new pool's vault addresses,
-    ///    tick arrays, and oracle accounts directly from the speculative bank's write
-    ///    cache — every account the creation transaction wrote is already there.
+    ///    tick arrays, and oracle accounts directly from the bank's write cache.
     ///
     /// 2. The current `MintPoolData` is atomically replaced via `ArcSwap::store`.
-    ///    The executor's next `load()` call returns the new version. Any simulation
-    ///    task holding a Guard from the previous generation completes safely against
-    ///    the old data — the previous Arc is freed only after all such Guards drop.
+    ///    The executor's next `load()` call returns the new version.
     ///
-    /// 3. All new accounts (pool state, vaults, tick arrays, etc.) are registered
-    ///    in `account_to_mint`, `cached_accounts_to_watch`, and `arb_graph` so that
-    ///    vault reserve changes trigger re-evaluation of arb pairs through this pool.
+    /// 3. All new accounts are registered in `account_to_mint`,
+    ///    `cached_accounts_to_watch`, and `arb_graph` so that vault reserve changes
+    ///    trigger re-evaluation of arb pairs through this pool.
     ///
     /// ## Unknown mint path
     ///
     /// If the non-quote token has not been seen before, `initialize_mint_from_discovered`
-    /// is called synchronously with the speculative bank.  This reads all sub-accounts
-    /// (vaults, tick arrays, oracles) directly from the bank's write cache — the
-    /// creation transaction's writes are already there.  On success, `register_mint`
-    /// is called and the executor is spawned immediately.
+    /// is called synchronously with the bank.  On success, `register_mint` is called
+    /// and the executor is spawned immediately.
     fn handle_pool_graduation(
         &mut self,
         detected: DetectedPool,
-        speculative_bank: &Arc<Bank>,
+        bank: &Arc<Bank>,
     ) {
-        // Confirm the pool account exists in the speculative bank. execute() applied
-        // the creation transaction's writes to the bank before producing the
-        // SpeculativeAccountUpdate, so if the pool address is absent here, the
-        // creation transaction failed within this batch.
-        if speculative_bank.get_account(&detected.pool_address).is_none() {
+        // Confirm the pool account exists in the bank. If the creation transaction
+        // failed within this batch, the pool address is absent — skip silently.
+        if bank.get_account(&detected.pool_address).is_none() {
             return;
         }
 
         // Identify which token is the speculative (non-quote) side of this pool.
-        // That token's mint is the key that determines which existing graph receives
-        // the new pool, or whether a brand new mint entry must be created.
         let is_quote = |m: &Pubkey| -> bool {
             *m == SOL_MINT || *m == USDC_MINT || *m == USDT_MINT || *m == USD1_MINT
         };
@@ -1319,21 +807,17 @@ impl MevEngine {
             detected.mint1
         };
 
-        // Both-quote pools (SOL/USDC, USDC/USDT, SOL/USD1, etc.) pass the
-        // has_quote_token filter in the graduation detector because at least one
-        // side is a quote token. But BOTH sides are quote tokens, so the selection
-        // above yields a quote token as the "speculative mint". Quote tokens are
-        // the denominators of the arb model — they are never the intermediate
-        // speculative token. Registering one as a speculative mint would corrupt
-        // the graph. Skip this pool entirely.
+        // Both-quote pools (SOL/USDC, USDC/USDT, etc.) pass the has_quote_token
+        // filter in the graduation detector because at least one side is a quote
+        // token. But BOTH sides are quote tokens, so the selection above yields a
+        // quote token as the "speculative mint". Quote tokens are the denominators
+        // of the arb model — they are never the intermediate speculative token.
+        // Registering one as a speculative mint would corrupt the graph.
         if is_quote(&mint) {
             return;
         }
 
         // Map the graduation source to the pool type used in the arb graph.
-        // This pairing is one-to-one: each GraduationSource corresponds to exactly
-        // one PoolType, and the PoolType drives which instruction builder path fires
-        // when a simulation or trade is attempted through this pool.
         let pool_type = match detected.source {
             GraduationSource::PumpSwap      => PoolType::PumpSwap,
             GraduationSource::RaydiumClmm   => PoolType::RaydiumClmm,
@@ -1352,23 +836,13 @@ impl MevEngine {
         };
 
         if self.mint_states.contains_key(&mint) {
-            // Known mint — fully integrate the new pool by:
-            //   a) Discovering vault / sub-account addresses from the speculative bank.
-            //   b) Atomically updating pool_data so the executor can build valid
-            //      swap instructions through the new pool immediately.
-            //   c) Registering all new accounts in routing and the bridge's watch set
-            //      so vault mutations trigger arb re-evaluation.
-
             let discovered = build_single_pool_discovered(&detected);
 
-            // Collect the new pool's account list. A temporary single-pool graph
-            // is built from the init result — this reuses the existing account
-            // extraction logic that runs at startup and avoids duplicating it here.
             let new_accounts: Vec<Pubkey> = match initialize_mint_from_discovered(
                 &mint,
                 discovered,
                 &self.wallet.pubkey(),
-                speculative_bank,
+                bank,
             ) {
                 Ok(init) => {
                     let temp_graph = ArbitrageGraph::build_with_config(
@@ -1377,17 +851,9 @@ impl MevEngine {
                     );
                     let accounts = temp_graph.all_tracked_accounts();
 
-                    // Atomically replace pool_data with an updated version that
-                    // includes the new pool's vault addresses, tick arrays, and
-                    // oracle accounts. The executor's current Guard holders continue
-                    // reading the previous version safely until they drop their Guard.
-                    // The borrow on self.mint_states is scoped here so account_to_mint
-                    // mutations below can proceed without overlapping borrows.
                     {
                         let state = self.mint_states.get(&mint).unwrap();
                         let current: Arc<MintPoolData> = state.pool_data.load_full();
-                        // Deep-clone the existing pool data to build the updated version.
-                        // This clone is O(n_pools) and happens once per graduation event.
                         let mut updated: MintPoolData = (*current).clone();
                         updated.merge_pools_from(init.pool_data);
                         state.pool_data.store(Arc::new(updated));
@@ -1396,11 +862,6 @@ impl MevEngine {
                     accounts
                 }
                 Err(e) => {
-                    // Vault data extraction failed — pool is grafted into the arb
-                    // graph for pair detection but simulation will fail until the
-                    // vault addresses are available. This is a degraded but bounded
-                    // state: the pool is not lost and will be fully available on the
-                    // next validator restart.
                     warn!(
                         "MevEngine: known-mint graduation vault extraction failed for \
                          {:?} pool {} mint {}: {} — pairs wired, simulation degraded",
@@ -1410,33 +871,24 @@ impl MevEngine {
                 }
             };
 
-            // Wire all new accounts into the arb graph. Passing the full account
-            // list (pool state + vaults + tick arrays + oracle) ensures that any
-            // reserve change in any sub-account triggers pair re-evaluation.
             let new_pairs = {
                 let state = self.mint_states.get(&mint).unwrap();
-                let mut graph = state.arb_graph.write().unwrap();
+                // Acquire the write lock to insert the new pool into the live arb
+                // graph. Recover from a poisoned lock: a panic inside add_pool on a
+                // previous call would have unwound cleanly; the graph remains
+                // structurally consistent and the new pool can still be inserted.
+                let mut graph = state.arb_graph.write().unwrap_or_else(|p| p.into_inner());
                 graph.add_pool(pool_info, &new_accounts)
             };
 
             for account in &new_accounts {
                 self.account_to_mint.insert(*account, mint);
             }
-            // Atomically extend the watched account Vec.  Load the current Vec,
-            // append only genuinely new accounts (dedup via account_to_mint which
-            // was just updated above), then store the new Vec.  This runs only on
-            // graduation events (rare) so the clone+store overhead is negligible.
-            //
-            // A HashSet is built from the existing Vec to provide O(1) membership
-            // testing — Vec::contains is O(n) and becomes O(n²) when called for
-            // each account over a large existing list.
+
             {
                 let current = self.cached_accounts_to_watch.load();
-                // Single clone — build new_vec first, then build the dedup set
-                // from it rather than cloning current a second time.
                 let mut new_vec: Vec<Pubkey> = (**current).clone();
-                let existing: std::collections::HashSet<Pubkey> =
-                    new_vec.iter().copied().collect();
+                let existing: FxHashSet<Pubkey> = new_vec.iter().copied().collect();
                 for account in &new_accounts {
                     if !existing.contains(account) {
                         new_vec.push(*account);
@@ -1445,8 +897,6 @@ impl MevEngine {
                 self.cached_accounts_to_watch.store(Arc::new(new_vec));
             }
 
-            // Append new accounts to tracked_accounts so a future de-registration
-            // sweep can bulk-remove them from account_to_mint without leaking entries.
             if let Some(state) = self.mint_states.get_mut(&mint) {
                 state.tracked_accounts.extend_from_slice(&new_accounts);
             }
@@ -1461,17 +911,13 @@ impl MevEngine {
                 new_accounts.len(),
             );
         } else {
-            // Unknown mint — run full discovery synchronously using the speculative bank.
-            // The bank's write cache already holds all accounts created in the same
-            // transaction as the pool (vaults, LUTs, etc.), so the parser can read
-            // them without any additional RPC calls.
             let discovered = build_single_pool_discovered(&detected);
 
             match initialize_mint_from_discovered(
                 &mint,
                 discovered,
                 &self.wallet.pubkey(),
-                speculative_bank,
+                bank,
             ) {
                 Ok(init) => {
                     info!(
@@ -1480,7 +926,6 @@ impl MevEngine {
                     );
                     self.register_mint(Arc::new(init.pool_data));
 
-                    // Spawn the executor for the newly discovered mint.
                     let idx = self
                         .pending_executor_starts
                         .iter()
@@ -1543,22 +988,10 @@ fn build_single_pool_discovered(detected: &DetectedPool) -> DiscoveredPools {
 // Tests
 // =============================================================================
 //
-// These tests exercise two properties of MevEngine that are critical for
-// correctness but invisible to the compiler:
-//
-//   1. Channel type contracts: the crossbeam channels that carry `Arc<Bank>` and
-//      `Slot` between ReplayStage and MevEngine must have exactly the right element
-//      type. The channels are created in `validator.rs` with concrete type parameters
-//      and passed through `tvu.rs` → `ReplaySenders` → `replay_stage.rs`. A type
-//      mismatch anywhere in that chain is a compile error, but these tests make the
-//      contract explicit and verify the values survive the round-trip without loss.
-//
-//   2. canonical_bank update pattern: `handle_frozen_bank` writes the incoming
-//      `Arc<Bank>` into `canonical_bank: Arc<RwLock<Option<Arc<Bank>>>>` under a
-//      write lock held for one assignment. `ArbitrageExecutor::try_execute_arbitrage`
-//      reads it under a read lock. These tests verify that the write pattern leaves
-//      the bank readable immediately after the lock is released and that the startup
-//      `None` state is correctly detected by the executor.
+// These tests cover the channel contracts that connect ReplayStage to MevEngine.
+// The channels carry `Arc<Bank>` (frozen canonical banks) and `Slot` (dead slots).
+// Verifying round-trip fidelity here makes the type contracts explicit and confirms
+// that values survive the crossbeam channel without loss or mutation.
 
 #[cfg(test)]
 mod tests {
@@ -1625,56 +1058,5 @@ mod tests {
             received, dead_slot,
             "dead slot value must be preserved exactly through the channel"
         );
-    }
-
-    // -------------------------------------------------------------------------
-    // Test 3 — canonical_bank RwLock update pattern
-    // -------------------------------------------------------------------------
-
-    /// Verifies the write pattern that `handle_frozen_bank` uses to update the
-    /// `canonical_bank: Arc<RwLock<Option<Arc<Bank>>>>` shared with all
-    /// `ArbitrageExecutor` instances.
-    #[test]
-    fn test_canonical_bank_rwlock_write_then_read_pattern() {
-        let canonical_bank: Arc<RwLock<Option<Arc<Bank>>>> =
-            Arc::new(RwLock::new(None));
-
-        assert!(
-            canonical_bank.read().unwrap().is_none(),
-            "canonical_bank must start as None before the first frozen bank arrives"
-        );
-
-        let GenesisConfigInfo { genesis_config: gc1, .. } = create_genesis_config(500_000);
-        let bank1 = Arc::new(Bank::new_for_tests(&gc1));
-        bank1.freeze();
-        let slot1 = bank1.slot();
-
-        {
-            let mut guard = canonical_bank.write().unwrap();
-            *guard = Some(Arc::clone(&bank1));
-        }
-
-        {
-            let read = canonical_bank.read().unwrap();
-            let stored = read.as_ref().expect("canonical_bank must be Some after first write");
-            assert_eq!(stored.slot(), slot1);
-            assert!(stored.is_frozen());
-        }
-
-        let GenesisConfigInfo { genesis_config: gc2, .. } = create_genesis_config(500_000);
-        let bank2 = Arc::new(Bank::new_for_tests(&gc2));
-        bank2.freeze();
-
-        {
-            let mut guard = canonical_bank.write().unwrap();
-            *guard = Some(Arc::clone(&bank2));
-        }
-
-        {
-            let read = canonical_bank.read().unwrap();
-            let stored = read.as_ref().expect("canonical_bank must be Some after second write");
-            assert_eq!(stored.slot(), bank2.slot());
-            assert!(stored.is_frozen());
-        }
     }
 }

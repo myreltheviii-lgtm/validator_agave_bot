@@ -59,8 +59,8 @@ use {
         blockstore::Blockstore,
         blockstore_processor::{
             self, BlockstoreProcessorError, ChainedBlockIdCheck, ConfirmationProgress,
-            ExecuteBatchesInternalMetrics, ReplaySlotStats, TransactionStatusSender,
-            check_chained_block_id,
+            ExecuteBatchesInternalMetrics, MevBatchSender, ReplaySlotStats,
+            TransactionStatusSender, check_chained_block_id,
         },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
@@ -324,6 +324,15 @@ pub struct ReplaySenders {
     /// pipeline has permanently discarded, which produces phantom profit
     /// estimates that can never be realised on-chain.
     pub mev_dead_slot_sender: crossbeam_channel::Sender<Slot>,
+    /// Carries each committed transaction batch to the MEV engine the instant
+    /// it is written to the bank, mid-slot, before `bank.freeze()`.  Account
+    /// state, lamport balances, and program logs for every transaction in the
+    /// batch are live in the bank by the time the payload is constructed.
+    /// Forwarded unchanged through replay_active_banks →
+    /// replay_active_bank / replay_active_banks_concurrently →
+    /// replay_blockstore_into_bank → confirm_slot, where execute_batch fires
+    /// it via try_send so a slow MEV consumer never back-pressures replay.
+    pub mev_batch_sender: MevBatchSender,
 }
 
 pub struct ReplayReceivers {
@@ -637,6 +646,7 @@ impl ReplayStage {
             lockouts_sender,
             mev_frozen_bank_sender,
             mev_dead_slot_sender,
+            mev_batch_sender,
         } = senders;
 
         let ReplayReceivers {
@@ -824,6 +834,7 @@ impl ReplayStage {
                     &votor_event_sender,
                     &mev_frozen_bank_sender,
                     &mev_dead_slot_sender,
+                    &mev_batch_sender,
                 );
                 let did_complete_bank = !new_frozen_slots.is_empty();
                 if migration_status.is_alpenglow_enabled() {
@@ -2460,6 +2471,7 @@ impl ReplayStage {
         log_messages_bytes_limit: Option<usize>,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
         migration_status: &MigrationStatus,
+        mev_batch_sender: &MevBatchSender,
     ) -> result::Result<usize, BlockstoreProcessorError> {
         let mut w_replay_stats = replay_stats.write().unwrap();
         let mut w_replay_progress = replay_progress.write().unwrap();
@@ -2481,6 +2493,7 @@ impl ReplayStage {
             log_messages_bytes_limit,
             prioritization_fee_cache,
             migration_status,
+            Some(mev_batch_sender),
         )?;
         let tx_count_after = w_replay_progress.num_txs;
         let tx_count = tx_count_after - tx_count_before;
@@ -3144,6 +3157,9 @@ impl ReplayStage {
         active_bank_slots: &[Slot],
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
         migration_status: &MigrationStatus,
+        // crossbeam Sender<T>: Sync — shared across rayon tasks by reference,
+        // no clone required.
+        mev_batch_sender: &MevBatchSender,
     ) -> Vec<ReplaySlotFromBlockstore> {
         // Make mutable shared structures thread safe.
         let progress = RwLock::new(progress);
@@ -3226,6 +3242,7 @@ impl ReplayStage {
                             log_messages_bytes_limit,
                             prioritization_fee_cache,
                             migration_status,
+                            mev_batch_sender,
                         );
                         replay_blockstore_time.stop();
                         replay_result.replay_result = Some(blockstore_result);
@@ -3259,6 +3276,7 @@ impl ReplayStage {
         bank_slot: Slot,
         prioritization_fee_cache: Option<&PrioritizationFeeCache>,
         migration_status: &MigrationStatus,
+        mev_batch_sender: &MevBatchSender,
     ) -> ReplaySlotFromBlockstore {
         let mut replay_result = ReplaySlotFromBlockstore {
             is_slot_dead: false,
@@ -3337,6 +3355,7 @@ impl ReplayStage {
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
                     migration_status,
+                    mev_batch_sender,
                 );
                 replay_blockstore_time.stop();
                 replay_result.replay_result = Some(blockstore_result);
@@ -3763,6 +3782,9 @@ impl ReplayStage {
         // Forwarded directly into process_replay_results where mark_dead_slot
         // sends the slot number when canonical replay rejects a block.
         mev_dead_slot_sender: &crossbeam_channel::Sender<Slot>,
+        // Forwarded to every replay_blockstore_into_bank call so that
+        // execute_batch fires MevExecutedBatch per committed batch mid-slot.
+        mev_batch_sender: &MevBatchSender,
     ) -> Vec<Slot> /* completed slots */ {
         let active_bank_slots = bank_forks.read().unwrap().active_bank_slots();
         let num_active_banks = active_bank_slots.len();
@@ -3790,6 +3812,7 @@ impl ReplayStage {
                     &active_bank_slots,
                     prioritization_fee_cache,
                     migration_status,
+                    mev_batch_sender,
                 )
             }
             ForkReplayMode::Serial | ForkReplayMode::Parallel(_) => active_bank_slots
@@ -3810,6 +3833,7 @@ impl ReplayStage {
                         *bank_slot,
                         prioritization_fee_cache,
                         migration_status,
+                        mev_batch_sender,
                     )
                 })
                 .collect(),

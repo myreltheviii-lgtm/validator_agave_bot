@@ -766,29 +766,21 @@ pub struct Validator {
     _tpu_client_next_runtime: Option<TokioRuntime>,
     // The MEV engine runs on its own OS thread ("solMevEngine"). Storing the
     // JoinHandle here allows join() to block on it during shutdown, guaranteeing
-    // the engine fully drains its incoming SpeculativeAccountUpdate channel
-    // before the process exits. If MEV is disabled, this is None.
+    // the engine fully drains its incoming MevExecutedBatch channel before the
+    // process exits. If MEV is disabled, this is None.
     mev_engine_thread: Option<JoinHandle<()>>,
-    /// Sender half of the speculative account-update channel that carries
-    /// per-slot account-delta values from the shredstream path into MevEngine.
+    /// Sender half of the executed-batch channel wired from `execute_batch()`
+    /// in `blockstore_processor` into `MevEngine`.
     ///
-    /// Stored here to keep the channel open for the entire validator lifetime.
-    /// MevEngine holds the receiver end; if this sender drops before MevEngine's
-    /// run() loop exits, every recv() returns Disconnected and the engine thread
-    /// exits immediately — starving MEV opportunity detection entirely.
+    /// Stored here to keep the channel alive for the entire validator lifetime.
+    /// If this sender is dropped before the engine thread exits, the engine's
+    /// `mev_batch_rx.recv()` returns `Disconnected` and the engine shuts down
+    /// immediately — losing all in-flight MEV opportunity detection.
     ///
-    /// The shredstream service (wired inside Tpu) holds a clone of this sender
-    /// to forward SpeculativeAccountUpdate values produced by execute() into
-    /// MevEngine's recv loop.
-    pub speculative_update_sender:
-        Sender<solana_ledger::devil_mode_jito__::SpeculativeAccountUpdate>,
-    /// The speculative slot executor, stored as a public field so that the
-    /// shredstream service (wired inside Tpu) can call execute() with each
-    /// incoming shredstream batch. MevEngine holds its own Arc clone for
-    /// confirm_slot / discard_slot — both references are independently
-    /// reference-counted and neither blocks the other.
-    pub speculative_executor:
-        Arc<solana_ledger::devil_mode_jito__::SpeculativeSlotExecutor>,
+    /// `blockstore_processor` holds a clone of this sender (injected during
+    /// Tvu construction) and calls `send()` on every committed batch.
+    /// `Option` allows the field to be set to `None` when MEV is disabled.
+    mev_batch_sender: Option<crossbeam_channel::Sender<crate::mev::engine::MevExecutedBatch>>,
     /// Sender half of the frozen-bank channel wired from ReplayStage into the
     /// MEV engine.  ReplayStage calls send() on a clone of this sender immediately
     /// after bank.freeze() so the engine receives each canonical bank before any
@@ -1187,19 +1179,20 @@ impl Validator {
         // ("solMevArb00-03"). It communicates with the rest of the validator
         // through three crossbeam channels:
         //
-        //   speculative_update_tx  →  MevEngine (per-slot account-delta updates
-        //                             produced by SpeculativeSlotExecutor.execute()
-        //                             via the shredstream bridge task)
+        //   mev_batch_tx       →  MevEngine (MevExecutedBatch from execute_batch()
+        //                         in blockstore_processor, fired on every committed
+        //                         transaction batch mid-slot before bank.freeze())
         //
-        //   mev_frozen_bank_tx     →  MevEngine (carries Arc<Bank> directly from
-        //                             ReplayStage the instant bank.freeze() returns,
-        //                             bypassing OptimisticallyConfirmedBankTracker
-        //                             entirely — zero RPC coupling, zero dependency-
-        //                             tracker latency)
+        //   mev_frozen_bank_tx →  MevEngine (carries Arc<Bank> directly from
+        //                         ReplayStage the instant bank.freeze() returns,
+        //                         bypassing OptimisticallyConfirmedBankTracker
+        //                         entirely — zero RPC coupling, zero dependency-
+        //                         tracker latency)
         //
-        //   mev_dead_slot_tx       →  MevEngine (carries Slot numbers from
-        //                             mark_dead_slot so the engine can evict
-        //                             speculative banks built on invalid entries)
+        //   mev_dead_slot_tx   →  MevEngine (carries Slot numbers from
+        //                         mark_dead_slot so the engine can evict
+        //                         pending_ready entries for slots that will never
+        //                         land on-chain)
         //
         // Both mev_frozen_bank_tx and mev_dead_slot_tx are stored in the
         // Validator struct and also routed through Tvu → ReplaySenders →
@@ -1209,6 +1202,12 @@ impl Validator {
         // no wallet file is read, no pool scan runs, and the thread is never
         // spawned. This keeps the default test validator behaviour unchanged.
         // ─────────────────────────────────────────────────────────────────────
+
+        // Executed-batch channel: blockstore_processor → MevEngine.
+        // Unbounded so execute_batch() is never back-pressured by MEV work.
+        // The engine drains this channel on every select! iteration.
+        let (mev_batch_tx, mev_batch_rx) =
+            crossbeam_channel::unbounded::<crate::mev::engine::MevExecutedBatch>();
 
         // Frozen bank channel: ReplayStage → MevEngine.
         // An unbounded channel is appropriate here because the producer fires
@@ -1223,48 +1222,6 @@ impl Validator {
         // channel is safe; the consumer processes each slot number in nanoseconds.
         let (mev_dead_slot_tx, mev_dead_slot_rx) =
             crossbeam_channel::unbounded::<Slot>();
-
-        // Build a dedicated rayon thread pool for speculative transaction replay.
-        // This pool is intentionally separate from the canonical replay pool that
-        // Tvu constructs internally — sharing threads between speculative and
-        // canonical execution would create contention and risk deadlocks because
-        // both paths call into process_entries and commit_transactions concurrently.
-        // The thread count mirrors replay_transactions_threads so speculative
-        // throughput scales with the same operator-controlled knob.
-        let speculative_replay_thread_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(config.replay_transactions_threads.get())
-                .thread_name(|i| format!("solSpecReplay{i:02}"))
-                .build()
-                .expect("failed to build speculative replay thread pool"),
-        );
-
-        let speculative_executor = Arc::new(
-            // SpeculativeSlotExecutor::new takes three arguments:
-            //   1. speculative_replay_thread_pool — the dedicated rayon pool built above
-            //   2. leader_schedule_cache — resolves the slot leader pubkey for each child bank
-            //   3. migration_status — forwarded to set_alpenglow_ticks() on every child bank
-            //      creation so that speculative banks have the same tick configuration as
-            //      canonical banks for the same slot. Arc::clone reuses the same MigrationStatus
-            //      instance already owned by the rest of the validator.
-            solana_ledger::devil_mode_jito__::SpeculativeSlotExecutor::new(
-                speculative_replay_thread_pool,
-                Arc::clone(&leader_schedule_cache),
-                Arc::clone(&migration_status),
-            ),
-        );
-
-        // Channel for SpeculativeAccountUpdate values: shredstream → MevEngine.
-        // Using an unbounded crossbeam channel here is safe because the producer
-        // (shredstream) runs on a Tokio task whose throughput is bounded by the
-        // shred arrival rate, and MevEngine's recv loop drains the channel on
-        // every iteration before doing any async work. A bounded channel would
-        // add back-pressure into the shredstream path and risk blocking Tokio
-        // executor threads.
-        let (speculative_update_tx, speculative_update_rx) =
-            crossbeam_channel::unbounded::<
-                solana_ledger::devil_mode_jito__::SpeculativeAccountUpdate,
-            >();
 
         let mev_engine_thread = if config.mev_enabled {
             let mev_startup_config = MevStartupConfig {
@@ -1285,21 +1242,14 @@ impl Validator {
                 .expect("failed to initialize MEV components");
 
             let bank_forks_clone = Arc::clone(&bank_forks);
-            let speculative_executor_clone = Arc::clone(&speculative_executor);
             let base_priority_fee = config.mev_base_priority_fee;
             let min_profit_lamports = config.mev_min_profit_lamports;
             let validation_mode = config.mev_validation_mode;
-            let speculative_accuracy_check = config.mev_speculative_accuracy_check;
             let shredstream_url = config.mev_shredstream_url.clone();
-            // Clone the sender before moving it into the engine thread closure so the
-            // original can still be stored in the Validator struct at the end of new().
-            // The engine thread owns one clone (used by run_async to spawn the bridge
-            // task), and the Validator struct owns the original (used by callers that
-            // need to forward account updates into the engine after construction).
-            let speculative_update_tx_for_engine = speculative_update_tx.clone();
             // Both channel receivers are moved into the engine thread.  The Validator
-            // struct retains the sender halves so that ReplayStage (wired through Tvu)
-            // can write to them for the entire validator lifetime.
+            // struct retains the sender halves so that blockstore_processor and
+            // ReplayStage (wired through Tvu) can write to them for the entire
+            // validator lifetime.
             let mev_frozen_bank_rx_for_engine = mev_frozen_bank_rx;
             let mev_dead_slot_rx_for_engine = mev_dead_slot_rx;
 
@@ -1307,20 +1257,17 @@ impl Validator {
                 std::thread::Builder::new()
                     .name("solMevEngine".to_string())
                     .spawn(move || {
-                        let engine = MevEngine::new(
-                            speculative_update_rx,
-                            speculative_update_tx_for_engine,
+                        let engine = crate::mev::engine::MevEngine::new(
+                            mev_batch_rx,
                             mev_frozen_bank_rx_for_engine,
                             mev_dead_slot_rx_for_engine,
                             bank_forks_clone,
-                            speculative_executor_clone,
                             mev_startup_result.wallet,
                             mev_startup_result.lut_manager,
                             mev_startup_result.rpc_client,
                             base_priority_fee,
                             min_profit_lamports,
                             validation_mode,
-                            speculative_accuracy_check,
                             shredstream_url,
                             mev_startup_result.mint_pool_data,
                         );
@@ -1330,14 +1277,14 @@ impl Validator {
             )
         } else {
             // MEV disabled: drop all channel ends immediately.  The sender
-            // halves (mev_frozen_bank_tx, mev_dead_slot_tx) are stored in the
-            // Validator struct below and will be dropped there on join().
-            // The receiver halves are dropped here because no engine thread
-            // exists to consume them — retaining them would keep the channels
-            // open indefinitely and leak memory.
+            // halves (mev_frozen_bank_tx, mev_dead_slot_tx, mev_batch_tx) are
+            // stored in the Validator struct below and will be dropped there on
+            // join().  The receiver halves are dropped here because no engine
+            // thread exists to consume them — retaining them would keep the
+            // channels open indefinitely and leak memory.
             drop(mev_frozen_bank_rx);
             drop(mev_dead_slot_rx);
-            drop(speculative_update_rx);
+            drop(mev_batch_rx);
             None
         };
 
@@ -1979,14 +1926,25 @@ impl Validator {
                 voting_service_test_override: config.voting_service_test_override.clone(),
             },
             config.shred_retransmit_receiver_addresses.clone(),
-            // Both MEV senders are cloned here so that the Validator struct
-            // can retain the originals for its entire lifetime while Tvu
-            // threads the clones into ReplaySenders.  ReplayStage holds the
-            // only consumers; if either sender is dropped before the engine
-            // thread exits, the engine's corresponding recv() returns
-            // Disconnected and the engine exits immediately.
+            // All three MEV channel senders are cloned here so that the
+            // Validator struct retains the originals (keeping the channels
+            // open) while Tvu threads the clones straight into ReplaySenders.
+            //
+            // Crossbeam channels use reference-counted state: a channel stays
+            // live as long as at least one Sender and one Receiver exist.
+            // Validator holds the "owner" Sender; the clone handed to Tvu
+            // reaches ReplayStage, which is the only component that actually
+            // calls .send().  When the engine thread exits, its corresponding
+            // Receiver is dropped; the next .send() from ReplayStage returns
+            // SendError, which ReplayStage treats as a no-op.
             mev_frozen_bank_tx.clone(),
             mev_dead_slot_tx.clone(),
+            // mev_batch_tx flows from execute_batch() inside
+            // blockstore_processor → Tvu → ReplaySenders → ReplayStage,
+            // which passes it down into the SVM execution path so every
+            // committed transaction batch is forwarded to the MEV engine
+            // before bank.freeze() completes.
+            mev_batch_tx.clone(),
         )
         .map_err(ValidatorError::Other)?;
 
@@ -2139,8 +2097,7 @@ impl Validator {
             xdp_retransmitter,
             _tpu_client_next_runtime: tpu_client_next_runtime,
             mev_engine_thread,
-            speculative_update_sender: speculative_update_tx,
-            speculative_executor,
+            mev_batch_sender: Some(mev_batch_tx),
             // Retain the MEV sender halves here so that the channels remain
             // open for the full validator lifetime.  The channel is kept alive
             // as long as at least one sender exists anywhere in the process;
@@ -2324,17 +2281,17 @@ impl Validator {
         if let Some(xdp_retransmitter) = self.xdp_retransmitter {
             xdp_retransmitter.join().expect("xdp_retransmitter");
         }
-        // Drop our copy of speculative_update_sender BEFORE joining Tpu.
+        // Drop our copy of mev_batch_sender BEFORE joining Tpu.
         //
-        // Tpu owns a clone of this sender (used by its shredstream service to
-        // forward SpeculativeAccountUpdate values). When Tpu.join() returns, Tpu
-        // drops its clone — at that moment the channel has no live senders and
-        // MevEngine's recv() loop sees Disconnected and exits its run() method.
-        // We then call mev_engine_thread.join() below to wait for the engine to
-        // finish draining any queued work. Dropping AFTER Tpu.join() would also
-        // work, but dropping here is more explicit about intent and matches the
-        // architectural invariant that our sender is always dropped first.
-        drop(self.speculative_update_sender);
+        // blockstore_processor (wired through Tvu) holds a clone of this sender
+        // and calls send() on every committed batch.  When Tpu.join() returns,
+        // Tvu drops its clone — at that moment the channel has no live senders
+        // and MevEngine's mev_batch_rx.recv() sees Disconnected and exits its
+        // run() select loop.  We then call mev_engine_thread.join() below to
+        // wait for the engine to finish draining any queued work.  Dropping
+        // here (before Tpu.join) is more explicit about intent and ensures no
+        // late sends are possible from any partially-torn-down thread.
+        drop(self.mev_batch_sender);
         // Drop both MEV channel senders before joining Tpu for the same reason
         // as above.  ReplayStage (inside Tvu, which is inside Tpu's dependency
         // chain) holds clones of both senders; when Tpu.join() returns those
