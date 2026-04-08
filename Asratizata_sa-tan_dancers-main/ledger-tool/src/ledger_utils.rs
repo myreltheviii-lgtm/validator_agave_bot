@@ -392,6 +392,31 @@ pub fn load_and_process_ledger(
     );
     let unified_scheduler_handler_threads =
         value_t!(arg_matches, "unified_scheduler_handler_threads", usize).ok();
+    // Solana supports two block-verification paths that differ in how transaction
+    // batches are dispatched during replay:
+    //
+    // ReplayTxThreads — the rayon global thread pool executes batches directly
+    //   inside blockstore_processor::execute_batch().  Because every batch passes
+    //   through that function before bank.freeze() is called, this is the path
+    //   where the MEV engine's mev_batch_sender fires its MevExecutedBatch signal.
+    //   No scheduler pool object exists; bank.has_installed_scheduler() returns
+    //   false for every bank throughout the validator's lifetime, which guarantees
+    //   the rayon branch is always taken inside process_batches().  ledger-tool
+    //   offline replay behaves identically — no pool, no installation — which is
+    //   why this arm returns None.
+    //
+    // UnifiedScheduler — a DefaultSchedulerPool is constructed and installed into
+    //   BankForks before replay begins.  The scheduler intercepts transaction
+    //   batches before they reach execute_batch(), so the MEV hook inside that
+    //   function is never reached.  This variant is kept for upstream compatibility
+    //   and as a rollback option if the rayon path causes unexpected issues.
+    //
+    // The type of `unified_scheduler_pool` is Option<Arc<DefaultSchedulerPool>>.
+    // Both arms must agree on that type: Some(pool) for UnifiedScheduler,
+    // None for ReplayTxThreads.  The Option is threaded through
+    // LoadAndProcessLedgerOutput so callers that care about the pool (e.g. the
+    // RPC service wanting to schedule block-verification tasks) can unwrap it,
+    // while callers on the rayon path simply ignore the None.
     let unified_scheduler_pool = match (&block_verification_method, &block_production_method) {
         methods @ (BlockVerificationMethod::UnifiedScheduler, _) => {
             let no_replay_vote_sender = None;
@@ -409,6 +434,16 @@ pub fn load_and_process_ledger(
                 .unwrap()
                 .install_scheduler_pool(pool.clone());
             Some(pool)
+        }
+        (BlockVerificationMethod::ReplayTxThreads, _) => {
+            // The rayon thread pool is implicit — it is the global pool that
+            // blockstore_processor::execute_batch() already dispatches to when
+            // bank.has_installed_scheduler() returns false.  There is nothing to
+            // construct here, and deliberately nothing to install into BankForks.
+            // Returning None satisfies the Option<Arc<DefaultSchedulerPool>> type
+            // while leaving the bank in the correct scheduler-free state for the
+            // entire offline replay that follows.
+            None
         }
     };
 

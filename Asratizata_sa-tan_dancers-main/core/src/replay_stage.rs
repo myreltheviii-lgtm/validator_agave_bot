@@ -2557,8 +2557,18 @@ impl ReplayStage {
         // mismatch.  The engine must discard every speculative bank rooted at
         // this slot and all speculative descendants to prevent arbitrage
         // simulation against account state the network has rejected.
+        //
+        // try_send is used instead of send because a channel receiver (the MEV
+        // engine) that is slow to drain must never be allowed to stall the
+        // replay loop.  Replay is the critical path for the entire validator:
+        // blocking here delays vote production, bank freezing, root advancement,
+        // and every downstream subscriber.  Dead-slot eviction in the MEV engine
+        // is a best-effort advisory — if this notification is dropped because the
+        // channel is momentarily full, the engine will still converge on correct
+        // state when the next frozen bank signal arrives and it attempts to rebase
+        // speculative descendants onto a slot that canonical replay has rejected.
         if let Some(sender) = mev_dead_slot_sender {
-            let _ = sender.send(slot);
+            let _ = sender.try_send(slot);
         }
 
         replay_vote_sender
@@ -3558,7 +3568,18 @@ impl ReplayStage {
                 // child banks built on predicted account state onto the now-
                 // verified canonical parent and emits correction deltas back
                 // through the speculative update handler.
-                let _ = mev_frozen_bank_sender.send(bank.clone_without_scheduler());
+                //
+                // try_send is used instead of send because process_replay_results
+                // runs on the main replay thread, which owns the critical path for
+                // the entire validator.  A slow MEV engine receiver must never
+                // cause replay to stall: doing so would delay bank_notification_sender,
+                // cost_update_sender, votor event emission, and BLS vote production
+                // for every slot until the engine drains its backlog.  A missed
+                // frozen-bank signal is self-healing — canonical_bank in the engine
+                // stays one slot behind until the channel clears and the next
+                // frozen bank is delivered, which for a healthy validator happens
+                // within the next slot boundary (~400 ms).
+                let _ = mev_frozen_bank_sender.try_send(bank.clone_without_scheduler());
 
                 datapoint_info!(
                     "bank_frozen",

@@ -413,11 +413,19 @@ impl ArbitrageExecutor {
         .map_err(|e| anyhow!("simulate_transaction task panicked for pair {}: {}", pair_idx, e))?;
 
         if sim_result.result.is_err() {
+            // `logs` is the Vec<String> the SVM collected from every `msg!()` call
+            // and program log emission during execution — the same output you would
+            // see from a simulateTransaction RPC call.  Logging it alongside the
+            // TransactionError variant gives a complete picture: the variant tells
+            // you the category of failure (InstructionError, InsufficientFunds, …)
+            // while the logs tell you exactly where inside the call stack the
+            // program decided to revert and what state it observed at that point.
             tracing::debug!(
-                "ArbitrageExecutor[{}]: pair {} simulation rejected: {:?}",
+                "ArbitrageExecutor[{}]: pair {} simulation rejected: {:?} | logs={:?}",
                 pool_data.mint,
                 pair_idx,
-                sim_result.result
+                sim_result.result,
+                sim_result.logs,
             );
             return Ok(());
         }

@@ -182,7 +182,24 @@ const WAIT_FOR_SUPERMAJORITY_THRESHOLD_PERCENT: u64 = 80;
 #[derive(Clone, EnumCount, EnumIter, EnumString, VariantNames, Default, IntoStaticStr, Display)]
 #[strum(serialize_all = "kebab-case")]
 pub enum BlockVerificationMethod {
+    /// Routes block verification through the rayon thread pool
+    /// (replay_tx_thread_pool inside ReplayStage).  This is the execution path
+    /// that flows through blockstore_processor::execute_batch(), which is the
+    /// only site where mev_batch_sender fires a MevExecutedBatch signal
+    /// mid-slot, before bank.freeze() has been called.  No scheduler pool is
+    /// allocated or installed into BankForks when this variant is active, so
+    /// bank.has_installed_scheduler() returns false on every bank for the
+    /// entire validator lifetime, guaranteeing the rayon branch is always taken
+    /// in process_batches().
     #[default]
+    ReplayTxThreads,
+
+    /// Routes block verification through the UnifiedScheduler pool.  The
+    /// scheduler intercepts transaction batches before they reach
+    /// execute_batch(), so the mev_batch_sender hook inside that function is
+    /// never reached.  This variant exists to preserve upstream compatibility
+    /// and to allow opt-in rollback via --block-verification-method
+    /// unified-scheduler if the rayon path causes unexpected issues.
     UnifiedScheduler,
 }
 
@@ -303,6 +320,21 @@ pub fn supported_scheduling_mode(
     match (verification, production) {
         (BlockVerificationMethod::UnifiedScheduler, _) => {
             SupportedSchedulingMode::Either(SchedulingMode::BlockVerification)
+        }
+        // supported_scheduling_mode is only ever called from within the
+        // UnifiedScheduler arm of the BlockVerificationMethod match in
+        // Validator::new().  The ReplayTxThreads arm of that match has an
+        // empty body and never calls this function, so this branch is
+        // structurally unreachable at runtime.  The compiler still requires
+        // exhaustiveness, and unreachable!() is strictly safer than returning
+        // a fabricated SupportedSchedulingMode value that would silently
+        // misconfigure a scheduler pool that should never exist for this path.
+        (BlockVerificationMethod::ReplayTxThreads, _) => {
+            unreachable!(
+                "supported_scheduling_mode must never be called for \
+                 BlockVerificationMethod::ReplayTxThreads — no scheduler pool \
+                 is allocated on this path"
+            )
         }
     }
 }
@@ -1329,6 +1361,18 @@ impl Validator {
             &config.block_verification_method,
             &config.block_production_method,
         ) {
+            // ReplayTxThreads: no scheduler pool is allocated.
+            // BankForks.scheduler_pool stays None permanently, so every bank
+            // produced by new_bank_from_parent is wrapped with
+            // BankWithScheduler::new_without_scheduler.  has_installed_scheduler()
+            // returns false on every bank, which forces process_batches() in
+            // blockstore_processor to always take the rayon branch and call
+            // execute_batches() → execute_batch().  execute_batch() is the only
+            // site in the entire replay pipeline that fires mev_batch_sender,
+            // delivering a MevExecutedBatch to the MEV engine for every
+            // committed transaction batch mid-slot, well before bank.freeze().
+            (BlockVerificationMethod::ReplayTxThreads, _) => {}
+
             methods @ (BlockVerificationMethod::UnifiedScheduler, _) => {
                 let scheduler_pool = DefaultSchedulerPool::new(
                     supported_scheduling_mode(methods),

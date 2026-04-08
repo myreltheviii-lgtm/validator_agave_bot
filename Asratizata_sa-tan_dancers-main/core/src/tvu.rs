@@ -889,13 +889,22 @@ pub mod tests {
             },
             Arc::new(ArcSwap::from_pointee(ShredReceiverAddresses::new())),
             // MEV is disabled in unit tests — the engine thread is never spawned
-            // and no one reads from these receivers, but both channel pairs must
+            // and no one reads from these receivers, but all three MEV senders must
             // exist here because Tvu::new always forwards them into ReplaySenders
             // regardless of whether the MEV engine is running.  The receivers are
             // dropped immediately after this call, which causes ReplayStage to see
             // Disconnected on its first recv — that is the correct no-MEV behaviour.
+            //
+            // mev_frozen_bank_sender: delivers a frozen Arc<Bank> to the engine
+            //   the instant bank.freeze() completes inside process_replay_results.
+            // mev_dead_slot_sender: delivers the slot number whenever mark_dead_slot
+            //   permanently rejects a slot so the engine can evict speculative state.
+            // mev_batch_sender: delivers executed transaction batches from
+            //   execute_batch inside blockstore_processor during replay of other
+            //   leaders' slots, used by the engine for speculative simulation.
             crossbeam_channel::unbounded::<Arc<solana_runtime::bank::Bank>>().0,
             crossbeam_channel::unbounded::<Slot>().0,
+            crossbeam_channel::unbounded().0,
         )
         .expect("assume success");
         exit.store(true, Ordering::Relaxed);
