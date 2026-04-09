@@ -181,6 +181,7 @@ solana-version = { workspace = true }
 solana-vote = { workspace = true }
 solana-vote-program = { workspace = true }
 spl-memo-interface = { workspace = true }
+spl-token-2022 = { version = "10.0.0", default-features = false, features = ["no-entrypoint"] }
 static_assertions = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
 strum_macros = { workspace = true }

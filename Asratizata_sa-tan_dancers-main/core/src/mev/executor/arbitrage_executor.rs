@@ -10,6 +10,7 @@ use {
     },
     anyhow::{anyhow, Result},
     arc_swap::ArcSwap,
+    crate::mev::constants::{USDC_MINT, USD1_MINT},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_compute_budget_interface::ComputeBudgetInstruction,
@@ -343,6 +344,43 @@ impl ArbitrageExecutor {
 
         // Validate the token-flow path and build the initial SMB instruction.
         let token_flow = TokenFlowValidator::validate_and_build_flow(path)?;
+
+        // [DEBUG — REMOVE AFTER DIAGNOSIS]
+        // Path-context log: printed once per candidate pair, right after token_flow
+        // is ready and before the instruction builder runs. Ties any downstream
+        // simulation rejection (IllegalOwner, account-index mismatch, etc.) to the
+        // exact pool-type combination and bridge state that produced the account list.
+        {
+            let pools = path.pools();
+            info!(
+                "ArbitrageExecutor[{}]: pair={} \
+                 pool1=[{:?} {}] pool2=[{:?} {}] \
+                 base_mint={} flashloan={} \
+                 bridge_usdc={} bridge_usd1={}",
+                pool_data.mint,
+                pair_idx,
+                pools[0].pool_type,
+                pools[0].address,
+                pools[1].pool_type,
+                pools[1].address,
+                token_flow[0].base_mint,
+                true, // executor always uses flashloan on the simulation path
+                // Recompute bridge-detection flags the same way build_instruction_with_flow
+                // does: scan only the pools in this specific path, not every pool in
+                // pool_data. This mirrors the guard in the instruction builder that prevents
+                // spurious bridge injection for tokens that happen to have a USDC pool
+                // elsewhere in pool_data but not in the current two-hop path.
+                token_flow.iter().any(|s| {
+                    SmbInstructionBuilder::find_pool_base_mint(&s.pool, &pool_data)
+                        .map_or(false, |m| m == USDC_MINT)
+                }),
+                token_flow.iter().any(|s| {
+                    SmbInstructionBuilder::find_pool_base_mint(&s.pool, &pool_data)
+                        .map_or(false, |m| m == USD1_MINT)
+                }),
+            );
+        }
+        // [END DEBUG]
 
         // Phase 1 instruction: zero profit threshold so simulation always runs fully,
         // generous CU limit so the executor never hits the cap mid-execution.

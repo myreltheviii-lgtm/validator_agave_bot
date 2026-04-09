@@ -337,6 +337,43 @@ impl SmbInstructionBuilder {
 
         debug!("Total accounts: {}", accounts.len());
 
+        // [DEBUG — REMOVE AFTER DIAGNOSIS]
+        // Pre-flight owner scan: ask the bank whether every account in the list
+        // actually exists on-chain and who owns it, before spending any compute
+        // units on simulation. The Solana runtime raises IllegalOwner when the
+        // SMB program's account-validation prologue finds an account whose owner
+        // field is the System Program rather than a token program. This most
+        // commonly happens for the wallet's intermediate token ATA on speculative
+        // mints the wallet has never traded — the ATA does not exist on-chain yet,
+        // so its implicit owner is the System Program. The scan runs at the call
+        // site that has the complete, ordered account list, so the index printed
+        // here is the exact index the SMB validator will reject. A None result
+        // means the account does not exist at all; a Some result with owner
+        // 11111...1 confirms an uninitialized (never-created) ATA.
+        for (i, account_meta) in accounts.iter().enumerate() {
+            match bank.get_account(&account_meta.pubkey) {
+                None => {
+                    info!(
+                        "PRE-SIM[{}]: account[{}] {} does NOT EXIST on-chain — \
+                         uninitialized ATA or missing PDA; this is the account \
+                         the SMB validator will reject with IllegalOwner",
+                        pool_data.mint, i, account_meta.pubkey
+                    );
+                }
+                Some(account) => {
+                    if *account.owner() == solana_sdk_ids::system_program::id() {
+                        info!(
+                            "PRE-SIM[{}]: account[{}] {} EXISTS but is owned by \
+                             SystemProgram — ATA was never initialized with a token \
+                             program; SMB validator will reject with IllegalOwner",
+                            pool_data.mint, i, account_meta.pubkey
+                        );
+                    }
+                }
+            }
+        }
+        // [END DEBUG]
+
         // Instruction layout (17 bytes total):
         // [0]     opcode = 28u8
         // [1..9]  minimum_profit: u64 little-endian  (executor fills realized profit check)
@@ -380,7 +417,7 @@ impl SmbInstructionBuilder {
     /// base_mint chosen for the entire two-hop path. Used exclusively to detect whether
     /// individual legs of the current path use USDC or USD1 as their quote token, which
     /// triggers bridge account insertion.
-    fn find_pool_base_mint(pool_info: &PoolInfo, pool_data: &MintPoolData) -> Option<Pubkey> {
+    pub(crate) fn find_pool_base_mint(pool_info: &PoolInfo, pool_data: &MintPoolData) -> Option<Pubkey> {
         match pool_info.pool_type {
             PoolType::RaydiumV4 => pool_data.raydium_pools.iter()
                 .find(|p| p.pool == pool_info.address).map(|p| p.base_mint),
