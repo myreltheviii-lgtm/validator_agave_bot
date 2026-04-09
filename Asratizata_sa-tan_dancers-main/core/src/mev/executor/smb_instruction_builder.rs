@@ -230,7 +230,7 @@ impl SmbInstructionBuilder {
 
         // Bridge insertion is gated on base_mint == SOL. If the global base is already USDC
         // all pools are USDC-denominated and no bridge is required.
-        if !use_flashloan && base_mint == sol_mint && has_usdc_base {
+        if base_mint == sol_mint && has_usdc_base {
             debug!("MIXED MODE: Adding SOL<>USDC bridge accounts");
             let wallet_usdc_account = crate::mev::constants::get_associated_token_address(&wallet.pubkey(), &usdc_mint);
             let raydium_sol_usdc_pool = solana_pubkey::pubkey!("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2");
@@ -249,7 +249,7 @@ impl SmbInstructionBuilder {
             accounts.push(AccountMeta::new(raydium_sol_usdc_pool, false));
             accounts.push(AccountMeta::new(raydium_usdc_vault, false));
             accounts.push(AccountMeta::new(raydium_sol_vault, false));
-        } else if !use_flashloan && base_mint == sol_mint && has_usd1_base {
+        } else if base_mint == sol_mint && has_usd1_base {
             debug!("MIXED MODE: Adding SOL<>USD1 bridge accounts");
             let wallet_usd1_account = crate::mev::constants::get_associated_token_address(&wallet.pubkey(), &usd1_mint);
             let raydium_sol_usd1_pool = solana_pubkey::pubkey!("FaDoeere161VKUFqcrQEM8it6kSCHKrLyq7wWyPvBkPq");
@@ -537,71 +537,45 @@ impl SmbInstructionBuilder {
             .find(|p| p.pool == pool_info.address)
             .ok_or_else(|| anyhow::anyhow!("Pump pool not found: {}", pool_info.address))?;
 
+        // All three PDAs were pre-computed at parse time in pool_parser::parse_pump_swap_pools
+        // and stored in PumpPool.  Reading them here is a plain struct field access — zero
+        // SHA-256 operations, zero allocations — compared to the 3× find_program_address calls
+        // (256 hashes each) that the previous implementation performed on every build.
         let fee_config = solana_pubkey::pubkey!("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx");
         let pump_fee_program = PUMP_FEE_PROGRAM_ID;
-
-        // The Pump AMM program ID is the authority under which all Pump swap PDAs are derived.
-        // This is the pAMM program (pAMMBay6...), not the original pump.fun bonding-curve program.
-        // Every PDA in the Pump AMM account model — volume accumulators, pool-v2 — is owned by
-        // this program, so passing the wrong program ID here silently produces PDAs that point
-        // at accounts owned by the System Program, causing IllegalOwner on-chain.
-        let pump_amm_id = solana_pubkey::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
-
-        // The global volume accumulator is a singleton PDA seeded only with a fixed string.
-        // It tracks protocol-wide swap volume and is shared across all Pump AMM pools.
-        // Because there is exactly one per program, its address never changes between pools.
-        let (global_volume_accumulator, _) =
-            Pubkey::find_program_address(&[b"global_volume_accumulator"], &pump_amm_id);
-
-        // The user volume accumulator is a per-wallet PDA that tracks how much volume a specific
-        // wallet has routed through the Pump AMM. The seed includes the wallet's pubkey so that
-        // every wallet has a distinct accumulator account. This is also the account that receives
-        // cashback rebates, which is why it must be writable for cashback-enabled tokens.
-        let (user_volume_accumulator, _) =
-            Pubkey::find_program_address(&[b"user_volume_accumulator", wallet.as_ref()], &pump_amm_id);
-
-        // pool-v2 is a per-token PDA that the on-chain executor reads to distinguish between
-        // Pump AMM v1 and v2 pool layouts. The seed is the token mint, not the pool address —
-        // one pool-v2 account exists per mint regardless of how many pool accounts exist for it.
-        let pool_v2 =
-            Pubkey::find_program_address(&[b"pool-v2", token_mint.as_ref()], &pump_amm_id).0;
 
         accounts.push(AccountMeta::new_readonly(pump_program_id(), false));
         accounts.push(AccountMeta::new_readonly(*base_mint, false));
         accounts.push(AccountMeta::new_readonly(pump_global_config(), false));
         accounts.push(AccountMeta::new_readonly(pump_authority(), false));
-        accounts.push(AccountMeta::new_readonly(pool.fee_wallet, false));
+        accounts.push(AccountMeta::new(pool.fee_wallet, false));
         accounts.push(AccountMeta::new(pool.pool, false));
         accounts.push(AccountMeta::new(pool.token_vault, false));
         accounts.push(AccountMeta::new(pool.sol_vault, false));
         accounts.push(AccountMeta::new(pool.fee_token_wallet, false));
         accounts.push(AccountMeta::new(pool.coin_creator_vault_ata, false));
         accounts.push(AccountMeta::new_readonly(pool.coin_creator_vault_authority, false));
-        accounts.push(AccountMeta::new_readonly(global_volume_accumulator, false));
-        accounts.push(AccountMeta::new(user_volume_accumulator, false));
+        accounts.push(AccountMeta::new_readonly(pool.global_volume_accumulator, false));
+        accounts.push(AccountMeta::new(pool.user_volume_accumulator, false));
         accounts.push(AccountMeta::new_readonly(fee_config, false));
         accounts.push(AccountMeta::new_readonly(pump_fee_program, false));
 
         // Cashback coins credit wSOL to the user_volume_accumulator after every swap.
-        // The accumulator's wSOL ATA receives the rebate and must appear as a writable account.
-        // Only the ATA is appended here — the accumulator PDA itself was already pushed above
-        // as part of the standard Pump account sequence and must not be duplicated.
-        // Standard Pump tokens omit this block entirely.
+        // Only the wSOL ATA of the accumulator is appended here — the accumulator itself
+        // was already pushed unconditionally in the block above.  Adding it a second time
+        // would shift every subsequent account index and break the executor's fixed offsets.
         if pool.is_cashback_coin {
-            // The wSOL ATA is derived from the user_volume_accumulator PDA as the ATA owner,
-            // not from the wallet. The rebate is credited to the accumulator's own token account
-            // so that it can be claimed separately from the wallet's main wSOL balance.
             let user_volume_accumulator_wsol_ata =
                 crate::mev::constants::get_associated_token_address(
-                    &user_volume_accumulator,
+                    &pool.user_volume_accumulator,
                     &SOL_MINT,
                 );
             accounts.push(AccountMeta::new(user_volume_accumulator_wsol_ata, false));
         }
 
-        // pool_v2 tells the on-chain executor which AMM version governs this pool,
-        // allowing it to select the correct swap path at runtime without a separate flag.
-        accounts.push(AccountMeta::new_readonly(pool_v2, false));
+        // pool_v2 is a pool-scoped PDA pre-computed at parse time.  The on-chain executor reads
+        // it to determine which AMM version governs this pool and select the correct swap path.
+        accounts.push(AccountMeta::new_readonly(pool.pool_v2, false));
 
         debug!("PUMP accounts added successfully");
         Ok(())
@@ -957,10 +931,6 @@ impl SmbInstructionBuilder {
         accounts.push(AccountMeta::new_readonly(*base_mint, false));
         accounts.push(AccountMeta::new(pool.dao, false));
         accounts.push(AccountMeta::new(pool.token_x_vault, false));
-        // token_sol_vault holds the base currency side of the Futarchy pool.
-        // When the FutarchyPool struct is updated to support non-SOL base currencies,
-        // this field will be renamed to token_base_vault to reflect that Futarchy pools
-        // can be denominated in any base currency, not just SOL.
         accounts.push(AccountMeta::new(pool.token_sol_vault, false));
 
         debug!("FUTARCHY accounts added successfully");
