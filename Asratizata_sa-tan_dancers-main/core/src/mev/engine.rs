@@ -153,6 +153,17 @@ pub struct MevEngine {
     /// capital.
     validation_mode: bool,
     shredstream_url: String,
+    /// Operator-configured floor for the Jito tip transfer in every submission
+    /// transaction.  Passed to every `ArbitrageExecutor` at construction time.
+    ///
+    /// The actual tip paid per transaction is `max(gross_profit × TIP_FRACTION,
+    /// jito_tip_lamports)` — proportional to the simulated gross profit so that
+    /// larger opportunities bid more aggressively in the Jito block-engine
+    /// auction, with this value as the absolute minimum to maintain dual-routing
+    /// eligibility through Helius Sender.  Must be at least
+    /// `HELIUS_SENDER_MIN_TIP_LAMPORTS` (200_000 lamports / 0.0002 SOL) or the
+    /// executor will panic at construction time.
+    jito_tip_lamports: u64,
     /// Lock-free read of the BankForks confirmed root slot.
     ///
     /// `ReadOnlyAtomicSlot` wraps the same `Arc<AtomicU64>` that `BankForks`
@@ -230,6 +241,7 @@ impl MevEngine {
         rpc_client: Arc<RpcClient>,
         base_priority_fee: u64,
         min_profit_lamports: u64,
+        jito_tip_lamports: u64,
         validation_mode: bool,
         shredstream_url: String,
         mint_pool_data: Vec<Arc<MintPoolData>>,
@@ -278,6 +290,7 @@ impl MevEngine {
             rpc_client,
             base_priority_fee,
             min_profit_lamports,
+            jito_tip_lamports,
             validation_mode,
             shredstream_url,
             root_slot,
@@ -368,6 +381,7 @@ impl MevEngine {
             Arc::clone(&self.rpc_client),
             self.base_priority_fee,
             self.min_profit_lamports,
+            self.jito_tip_lamports,
             self.validation_mode,
         ));
 
@@ -462,6 +476,7 @@ impl MevEngine {
             Arc::clone(&self.rpc_client),
             self.base_priority_fee,
             self.min_profit_lamports,
+            self.jito_tip_lamports,
             self.validation_mode,
         ));
 

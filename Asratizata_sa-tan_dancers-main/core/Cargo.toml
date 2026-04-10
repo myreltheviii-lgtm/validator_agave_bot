@@ -58,6 +58,7 @@ arc-swap = { workspace = true }
 arrayvec = { workspace = true }
 assert_matches = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bincode = { workspace = true }
 borsh = { workspace = true }
 bs58 = { workspace = true }
@@ -84,12 +85,14 @@ qualifier_attr = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 rayon = { workspace = true }
 rolling-file = { workspace = true }
 rustls = { workspace = true }
 rustc-hash = "2.1.0"
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+serde_json = { workspace = true }
 signal-hook = { workspace = true }
 slab = { workspace = true }
 smallvec = { workspace = true }

@@ -892,6 +892,19 @@ pub fn execute(
     // A zero default is safe when mev_enabled is false because the engine never runs.
     let mev_min_profit_lamports = value_t!(matches, "mev_min_profit_lamports", u64).unwrap_or(0);
 
+    // The absolute Jito tip floor in lamports.  Helius Sender's dual-routing model
+    // fires both a staked SWQOS connection and the Jito block-engine auction path
+    // simultaneously only when the tip transfer is at least 200_000 lamports
+    // (0.0002 SOL).  Below that threshold the Jito path is silently suppressed and
+    // the transaction travels only via SWQOS, losing the parallel race advantage.
+    // Defaulting to 200_000 means an operator who omits this flag still gets full
+    // dual-routing; they only need to set it explicitly if they want to bid higher
+    // on a competitive tip market.  Zero is NOT a safe default here because
+    // ArbitrageExecutor::new asserts jito_tip_lamports >= HELIUS_SENDER_MIN_TIP_LAMPORTS
+    // and would panic at engine startup if the default were lower than 200_000.
+    let mev_jito_tip_lamports =
+        value_t!(matches, "mev_jito_tip_lamports", u64).unwrap_or(200_000);
+
     // gRPC URL of the Jito ShredStream proxy. The shredstream bridge task inside
     // MevEngine::run_async connects to this endpoint and subscribes to the slot-entry
     // stream, delivering individual entry batches to SpeculativeSlotExecutor::execute
@@ -1042,6 +1055,7 @@ pub fn execute(
         mev_speculative_accuracy_check,
         mev_lut_addresses,
         mev_min_profit_lamports,
+        mev_jito_tip_lamports,
         mev_shredstream_url,
     };
 

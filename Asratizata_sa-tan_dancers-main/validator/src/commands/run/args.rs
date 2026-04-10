@@ -1499,6 +1499,26 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("mev_jito_tip_lamports")
+            .long("mev-jito-tip-lamports")
+            .value_name("LAMPORTS")
+            .takes_value(true)
+            .requires("mev_enabled")
+            .validator(|s| is_parsable::<u64>(s))
+            .help(
+                "Absolute floor for the Jito tip transfer in lamports included in every \
+                 submission transaction. The actual tip paid per trade is \
+                 max(gross_profit * 0.60, this_value), so larger opportunities bid \
+                 proportionally more while this value ensures the bid never drops below \
+                 the Helius Sender dual-routing eligibility threshold. Helius Sender \
+                 requires at least 200000 lamports (0.0002 SOL) for the Jito block-engine \
+                 path to fire alongside SWQOS; below that the relay silently suppresses \
+                 the Jito leg and the transaction competes only through the staked SWQOS \
+                 connection. Defaults to 200000 when omitted. Raise this on competitive \
+                 tip markets to increase the minimum auction bid.",
+            ),
+    )
+    .arg(
         Arg::with_name("mev_shredstream_url")
             .long("mev-shredstream-url")
             .value_name("URL")

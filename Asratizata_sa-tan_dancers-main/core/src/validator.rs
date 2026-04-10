@@ -465,6 +465,16 @@ pub struct ValidatorConfig {
     /// be calibrated against current network priority fees and the cost of a
     /// failed transaction (which still pays fees).
     pub mev_min_profit_lamports: u64,
+    /// Absolute floor for the Jito tip transfer in lamports included in every
+    /// submission transaction.  The actual tip paid per trade is
+    /// max(gross_profit × TIP_FRACTION, mev_jito_tip_lamports), so larger
+    /// opportunities bid proportionally more while this value ensures the bid
+    /// never drops below the Helius Sender dual-routing eligibility threshold.
+    /// Helius Sender requires at least 200_000 lamports (0.0002 SOL) in the tip
+    /// transfer for the Jito block-engine path to fire alongside SWQOS; setting
+    /// this below that value silently reduces every submission to single-path
+    /// SWQOS-only routing, losing the parallel race advantage.
+    pub mev_jito_tip_lamports: u64,
     /// WebSocket URL of the Jito ShredStream endpoint this validator subscribes
     /// to for pre-confirmation shred data.  ShredStream delivers individual
     /// shreds to the MEV engine as soon as the leader broadcasts them — before
@@ -598,6 +608,11 @@ impl ValidatorConfig {
             // transaction at 1 microlamport/CU plus small buffer for fee variance.
             // Tests never reach this code path because mev_enabled is false.
             mev_min_profit_lamports: 5_000,
+            // 200_000 lamports is the Helius Sender minimum for the Jito block-engine
+            // path to fire alongside SWQOS.  Tests never exercise this path because
+            // mev_enabled is false; the value prevents the struct literal from being
+            // structurally incomplete.
+            mev_jito_tip_lamports: 200_000,
             // Point at localhost so tests that accidentally instantiate the engine
             // fail fast rather than hanging on a network call.
             mev_shredstream_url: "http://127.0.0.1:8001".to_string(),
@@ -1276,6 +1291,7 @@ impl Validator {
             let bank_forks_clone = Arc::clone(&bank_forks);
             let base_priority_fee = config.mev_base_priority_fee;
             let min_profit_lamports = config.mev_min_profit_lamports;
+            let jito_tip_lamports = config.mev_jito_tip_lamports;
             let validation_mode = config.mev_validation_mode;
             let shredstream_url = config.mev_shredstream_url.clone();
             // Both channel receivers are moved into the engine thread.  The Validator
@@ -1299,6 +1315,7 @@ impl Validator {
                             mev_startup_result.rpc_client,
                             base_priority_fee,
                             min_profit_lamports,
+                            jito_tip_lamports,
                             validation_mode,
                             shredstream_url,
                             mev_startup_result.mint_pool_data,
