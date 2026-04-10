@@ -10,11 +10,11 @@ use {
     },
     anyhow::{anyhow, Result},
     arc_swap::ArcSwap,
-    crate::mev::constants::{USDC_MINT, USD1_MINT},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_instruction::Instruction,
+    solana_client::rpc_config::RpcSendTransactionConfig,
     solana_keypair::Keypair,
     solana_signature::Signature,
     solana_signer::Signer,
@@ -345,43 +345,6 @@ impl ArbitrageExecutor {
         // Validate the token-flow path and build the initial SMB instruction.
         let token_flow = TokenFlowValidator::validate_and_build_flow(path)?;
 
-        // [DEBUG — REMOVE AFTER DIAGNOSIS]
-        // Path-context log: printed once per candidate pair, right after token_flow
-        // is ready and before the instruction builder runs. Ties any downstream
-        // simulation rejection (IllegalOwner, account-index mismatch, etc.) to the
-        // exact pool-type combination and bridge state that produced the account list.
-        {
-            let pools = path.pools();
-            info!(
-                "ArbitrageExecutor[{}]: pair={} \
-                 pool1=[{:?} {}] pool2=[{:?} {}] \
-                 base_mint={} flashloan={} \
-                 bridge_usdc={} bridge_usd1={}",
-                pool_data.mint,
-                pair_idx,
-                pools[0].pool_type,
-                pools[0].address,
-                pools[1].pool_type,
-                pools[1].address,
-                token_flow[0].base_mint,
-                true, // executor always uses flashloan on the simulation path
-                // Recompute bridge-detection flags the same way build_instruction_with_flow
-                // does: scan only the pools in this specific path, not every pool in
-                // pool_data. This mirrors the guard in the instruction builder that prevents
-                // spurious bridge injection for tokens that happen to have a USDC pool
-                // elsewhere in pool_data but not in the current two-hop path.
-                token_flow.iter().any(|s| {
-                    SmbInstructionBuilder::find_pool_base_mint(&s.pool, &pool_data)
-                        .map_or(false, |m| m == USDC_MINT)
-                }),
-                token_flow.iter().any(|s| {
-                    SmbInstructionBuilder::find_pool_base_mint(&s.pool, &pool_data)
-                        .map_or(false, |m| m == USD1_MINT)
-                }),
-            );
-        }
-        // [END DEBUG]
-
         // Phase 1 instruction: zero profit threshold so simulation always runs fully,
         // generous CU limit so the executor never hits the cap mid-execution.
         let sim_instruction = SmbInstructionBuilder::build_instruction_with_flow(
@@ -556,15 +519,45 @@ impl ArbitrageExecutor {
 
     /// Submit the transaction via `spawn_blocking` to avoid stalling the Tokio
     /// executor thread on the synchronous blocking HTTP round-trip to the RPC.
+    ///
+    /// Preflight is a second simulation the RPC node runs against its own bank
+    /// snapshot before forwarding the packet to the TPU. Our simulation in Phase 1
+    /// already ran `simulate_transaction_unchecked` against the live canonical bank
+    /// mid-slot — the most current possible state, ahead of any snapshot the RPC
+    /// would hold at submission time. Running preflight after that creates two
+    /// problems:
+    ///
+    /// 1. Latency: an extra blocking HTTP round-trip plus a full SVM execution on
+    ///    the RPC side, all before the packet even reaches the TPU.
+    ///
+    /// 2. False negatives: if the bank has advanced one or more batches between our
+    ///    simulation and the preflight check, preflight may observe a different pool
+    ///    state and reject a transaction that would have landed profitably — the
+    ///    opportunity is silently discarded even though it was valid at submission
+    ///    time.
+    ///
+    /// The on-chain program already enforces the profit floor at execution time,
+    /// reverting cleanly with no net loss if the trade is no longer profitable when
+    /// the transaction lands. That guarantee makes preflight's safety net redundant.
+    /// Skipping it sends the transaction directly into the TPU pipeline without a
+    /// redundant, potentially-stale simulation pass.
     async fn send_transaction(
         &self,
         transaction: VersionedTransaction,
     ) -> Result<Signature> {
         let rpc = Arc::clone(&self.rpc_client);
-        tokio::task::spawn_blocking(move || rpc.send_transaction(&transaction))
-            .await
-            .map_err(|e| anyhow!("send_transaction task panicked: {}", e))?
-            .map_err(|e| anyhow!("send_transaction RPC error: {}", e))
+        tokio::task::spawn_blocking(move || {
+            rpc.send_transaction_with_config(
+                &transaction,
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .map_err(|e| anyhow!("send_transaction task panicked: {}", e))?
+        .map_err(|e| anyhow!("send_transaction RPC error: {}", e))
     }
 
     /// Poll the cluster for transaction confirmation at fixed intervals until the
