@@ -28,11 +28,27 @@ use crate::mev::dex::futarchy::futarchy_program_id;
 // guaranteed to match what token_flow_validator.rs and arbitrage_graph.rs use.
 use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
 use crate::mev::executor::token_flow_validator::TokenFlowStep;
+// An Associated Token Account (ATA) is a Program Derived Address — a deterministic,
+// off-curve address that no private key controls — derived from the triple
+// [wallet, token_program_id, mint] under the SPL Associated Token Account program.
+// Two token programs exist on Solana: the classic SPL Token program and Token-2022.
+// Because the token_program_id is part of the seed, the same wallet and mint pair
+// produce two distinct ATA addresses under the two programs; supplying the wrong
+// program ID at derivation time yields an address the on-chain program will reject.
+// `spl_associated_token_account_interface` is the single authoritative source for both
+// derivation paths — its seed layout and program address constant are guaranteed to
+// stay in sync with what every on-chain program and the Solana runtime independently
+// derive for the same inputs.
+use spl_associated_token_account_interface::address::{
+    get_associated_token_address,
+    get_associated_token_address_with_program_id,
+};
 
-const SMB_PROGRAM_ID: solana_pubkey::Pubkey = solana_pubkey::pubkey!("MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz");
-const MEMO_PROGRAM_ID: solana_pubkey::Pubkey = solana_pubkey::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
-const SYSVAR_INSTRUCTIONS_ID: solana_pubkey::Pubkey = solana_pubkey::pubkey!("Sysvar1nstructions1111111111111111111111111");
-const PUMP_FEE_PROGRAM_ID: solana_pubkey::Pubkey = solana_pubkey::pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+const SMB_PROGRAM_ID: Pubkey = solana_pubkey::pubkey!("MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz");
+const MEMO_PROGRAM_ID: Pubkey = solana_pubkey::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+const SYSVAR_INSTRUCTIONS_ID: Pubkey = solana_pubkey::pubkey!("Sysvar1nstructions1111111111111111111111111");
+const PUMP_FEE_PROGRAM_ID: Pubkey = solana_pubkey::pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+
 
 pub struct SmbInstructionBuilder;
 
@@ -131,7 +147,7 @@ impl SmbInstructionBuilder {
         debug!("IS_USDC_BASE: {}", base_mint == usdc_mint);
 
         let wallet_base_account = if base_mint == usdc_mint {
-            let usdc_ata = crate::mev::constants::get_associated_token_address(
+            let usdc_ata = get_associated_token_address(
                 &wallet.pubkey(),
                 &usdc_mint
             );
@@ -167,9 +183,19 @@ impl SmbInstructionBuilder {
             AccountMeta::new_readonly(base_mint, false),
             AccountMeta::new(fee_collector, false),
             AccountMeta::new(wallet_base_account, false),
-            AccountMeta::new_readonly(crate::mev::constants::SPL_TOKEN_PROGRAM_ID, false),
+            // The classic SPL Token program is always listed here because the executor's
+            // flashloan and wSOL wrap/unwrap operations target SPL Token accounts. The
+            // canonical program ID comes from `spl_token_interface::id()` — a dedicated
+            // interface crate that exposes the program ID without importing the full
+            // token implementation, keeping the dependency graph minimal.
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
             AccountMeta::new_readonly(solana_sdk_ids::system_program::id(), false),
-            AccountMeta::new_readonly(crate::mev::constants::SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID, false),
+            // The SPL Associated Token Account program is listed here so the on-chain
+            // executor can create ATAs for the wallet when it encounters a mint it has
+            // never held before. `spl_associated_token_account_interface::program::id()`
+            // is the canonical accessor — it returns the same 32-byte program address
+            // that the Solana runtime validates during ATA ownership checks.
+            AccountMeta::new_readonly(spl_associated_token_account_interface::program::id(), false),
         ];
 
         debug!("Base accounts added: {}", accounts.len());
@@ -197,7 +223,7 @@ impl SmbInstructionBuilder {
                 debug!("Using PDA vault token account: {}", vault_pda);
                 vault_pda
             } else {
-                let vault_ata = crate::mev::constants::get_associated_token_address(
+                let vault_ata = get_associated_token_address(
                     &vault_authority,
                     &base_mint,
                 );
@@ -232,7 +258,7 @@ impl SmbInstructionBuilder {
         // all pools are USDC-denominated and no bridge is required.
         if base_mint == sol_mint && has_usdc_base {
             debug!("MIXED MODE: Adding SOL<>USDC bridge accounts");
-            let wallet_usdc_account = crate::mev::constants::get_associated_token_address(&wallet.pubkey(), &usdc_mint);
+            let wallet_usdc_account = get_associated_token_address(&wallet.pubkey(), &usdc_mint);
             let raydium_sol_usdc_pool = solana_pubkey::pubkey!("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2");
             // HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz is the USDC vault of this pool.
             // DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz is the SOL (wSOL) vault.
@@ -251,7 +277,7 @@ impl SmbInstructionBuilder {
             accounts.push(AccountMeta::new(raydium_sol_vault, false));
         } else if base_mint == sol_mint && has_usd1_base {
             debug!("MIXED MODE: Adding SOL<>USD1 bridge accounts");
-            let wallet_usd1_account = crate::mev::constants::get_associated_token_address(&wallet.pubkey(), &usd1_mint);
+            let wallet_usd1_account = get_associated_token_address(&wallet.pubkey(), &usd1_mint);
             let raydium_sol_usd1_pool = solana_pubkey::pubkey!("FaDoeere161VKUFqcrQEM8it6kSCHKrLyq7wWyPvBkPq");
             let raydium_usd1_vault = solana_pubkey::pubkey!("GLx7TdT66CPKYJBn3Pzc9khrfXEx6mXtAiE8uskGBQJq");
             let raydium_sol_vault  = solana_pubkey::pubkey!("3U9HB8KNHXmAmiGMbDsj6fBxzM63dfX5JbaYs5oTHbtu");
@@ -270,7 +296,7 @@ impl SmbInstructionBuilder {
         accounts.push(AccountMeta::new_readonly(pool_data.mint, false));
         accounts.push(AccountMeta::new_readonly(pool_data.token_program, false));
 
-        let wallet_token_account = crate::mev::constants::get_associated_token_address_with_program_id(
+        let wallet_token_account = get_associated_token_address_with_program_id(
             &wallet.pubkey(),
             &pool_data.mint,
             &pool_data.token_program,
@@ -603,7 +629,7 @@ impl SmbInstructionBuilder {
         // would shift every subsequent account index and break the executor's fixed offsets.
         if pool.is_cashback_coin {
             let user_volume_accumulator_wsol_ata =
-                crate::mev::constants::get_associated_token_address(
+                get_associated_token_address(
                     &pool.user_volume_accumulator,
                     &SOL_MINT,
                 );

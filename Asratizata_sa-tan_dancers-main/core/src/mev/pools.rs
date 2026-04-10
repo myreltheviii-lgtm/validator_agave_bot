@@ -17,6 +17,14 @@ use super::{
 const POOL_TICK_ARRAY_BITMAP_SEED_CLMM: &str = "pool_tick_array_bitmap_extension";
 
 use solana_pubkey::Pubkey;
+// An Associated Token Account (ATA) is a Program Derived Address whose canonical seed
+// triple is [wallet, token_program_id, mint], derived under the SPL Associated Token
+// Account program. `spl_associated_token_account_interface` is the lightweight interface
+// crate that owns the seed layout, the program address constant, and the PDA derivation
+// logic. Importing from it — rather than reimplementing the derivation locally — guarantees
+// byte-for-byte agreement with every on-chain program and the Solana runtime regardless of
+// future SPL crate updates.
+use spl_associated_token_account_interface::address::get_associated_token_address;
 
 #[derive(Debug, Clone)]
 pub struct RaydiumPool {
@@ -266,10 +274,14 @@ pub struct MintPoolData {
 impl MintPoolData {
     pub fn new(mint: Pubkey, wallet_account: &Pubkey, token_program: Pubkey) -> Self {
         let sol = sol_mint();
-        // The wallet's wSOL ATA is always derived against the standard SPL Token program
-        // regardless of the target token's program, because wSOL is always a plain SPL token.
-        let wallet_wsol_pk =
-            crate::mev::constants::get_associated_token_address(wallet_account, &sol);
+        // wSOL is always governed by the classic SPL Token program regardless of the target
+        // token's program variant. The ATA derivation uses the canonical seeds:
+        // [wallet, spl_token_program_id, wSOL_mint] under the SPL Associated Token Account
+        // program. `get_associated_token_address` from the interface crate hardcodes the
+        // classic token program ID in its seed — it is the single-argument form of the
+        // derivation, equivalent to calling the two-argument form with the classic token
+        // program. This is correct for wSOL because wSOL is always a classic SPL Token.
+        let wallet_wsol_pk = get_associated_token_address(wallet_account, &sol);
         Self {
             mint,
             token_program,
@@ -344,7 +356,7 @@ impl MintPoolData {
         is_mayhem_mode: bool,
         is_cashback_coin: bool,
     ) {
-        // The pump_program_id_internal is the canonical PDA authority for the Pump AMM.
+        // The pump_pda_authority is the program that owns the Pump AMM PDA accounts.
         // It is distinct from pump_program_id() (the swap instruction program).
         let pump_pda_authority =
             solana_pubkey::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");

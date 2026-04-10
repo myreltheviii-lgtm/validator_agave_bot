@@ -55,7 +55,7 @@ pub fn scan_all_mints_no_init(bank: &Arc<Bank>) -> Result<MintDiscoveryResult> {
 /// # Token-2022 detection
 ///
 /// The mint account's `owner` field determines which SPL token program governs
-/// the mint: `spl_token::id()` for classic SPL Token, `spl_token_2022::id()` for
+/// the mint: `spl_token_interface::id()` for classic SPL Token, `spl_token_2022::id()` for
 /// Token-2022. This owner is read directly from the bank — no RPC call required.
 /// The detected program ID is stored in every pool struct so the instruction
 /// builder can derive wallet ATAs with the correct program at build time.
@@ -82,14 +82,20 @@ pub fn initialize_mint_from_discovered(
         .get_account(mint)
         .ok_or_else(|| anyhow::anyhow!("Mint account not found in bank: {}", mint))?;
 
-    // SPL Token and Token-2022 program IDs are compile-time constants from crate::mev::constants.
-    // Using the crate-inlined constants avoids the version conflict where spl-token/spl-token-2022
-    // crates bring in a different solana-pubkey than the workspace version, producing two
-    // incompatible Pubkey types. The constants here are the same 32 bytes — just declared locally.
-    let token_2022_program_id = crate::mev::constants::SPL_TOKEN_2022_PROGRAM_ID;
+    // The SPL Token program (`TokenkegQ…`) and Token-2022 program (`TokenzQd…`) are
+    // the only two valid owners for a mint account on Solana. Reading the owner field
+    // from the bank's in-memory account store and comparing it against the canonical
+    // program IDs exposed by the `spl-token-interface` and `spl-token-2022` crates
+    // determines which variant governs this mint.
+    //
+    // `spl_token_interface::id()` returns the classic SPL Token program ID as a
+    // `solana_pubkey::Pubkey`, and `spl_token_2022::id()` returns the Token-2022
+    // program ID — both sourced from the same modular crate family that agave 4.x
+    // uses, so the `Pubkey` type is identical to the one used throughout this workspace.
+    let token_2022_program_id = spl_token_2022::id();
 
-    let token_program = if *mint_account.owner() == crate::mev::constants::SPL_TOKEN_PROGRAM_ID {
-        crate::mev::constants::SPL_TOKEN_PROGRAM_ID
+    let token_program = if *mint_account.owner() == spl_token_interface::id() {
+        spl_token_interface::id()
     } else if *mint_account.owner() == token_2022_program_id {
         token_2022_program_id
     } else {
@@ -101,7 +107,7 @@ pub fn initialize_mint_from_discovered(
     // present inside the hook invocation. For plain SPL tokens this is None and callers
     // omit the memo account entirely. Whirlpool is an exception — the instruction builder
     // always hardcodes the memo program for Whirlpool regardless of this value.
-    let memo_program_id: Option<Pubkey> = if token_program != crate::mev::constants::SPL_TOKEN_PROGRAM_ID {
+    let memo_program_id: Option<Pubkey> = if token_program != spl_token_interface::id() {
         // compile-time decode — no runtime base58 parse, no unwrap
         Some(solana_pubkey::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"))
     } else {

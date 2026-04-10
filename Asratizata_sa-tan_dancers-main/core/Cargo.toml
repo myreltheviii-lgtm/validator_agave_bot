@@ -180,8 +180,23 @@ solana-validator-exit = { workspace = true }
 solana-version = { workspace = true }
 solana-vote = { workspace = true }
 solana-vote-program = { workspace = true }
+# Thin interface crate that exposes only the ATA program ID and the
+# get_associated_token_address derivation function, without pulling in the
+# full spl-associated-token-account runtime (entrypoint, processor, etc.).
+# This is the correct import source for any code that derives ATAs or needs
+# the ATA program ID — using a hardcoded constant instead would silently
+# produce the wrong address if the constant drifts from the canonical value.
+spl-associated-token-account-interface = { workspace = true }
 spl-memo-interface = { workspace = true }
+# The full Token-2022 crate, compiled without its on-chain entrypoint so it
+# can be linked into validator/off-chain code without symbol conflicts.
+# Token-2022 is the successor to the original SPL Token program and adds
+# confidential transfers, transfer hooks, and other extensions.
 spl-token-2022 = { version = "10.0.0", default-features = false, features = ["no-entrypoint"] }
+# Thin interface crate that exposes the canonical SPL Token program ID via
+# spl_token_interface::id(). Using this instead of a bare string or a local
+# constant ensures the ID always matches whatever the workspace has pinned.
+spl-token-interface = { workspace = true }
 static_assertions = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
 strum_macros = { workspace = true }

@@ -29,7 +29,18 @@ use solana_runtime::bank::Bank;
 use solana_pubkey::Pubkey;
 use std::sync::Arc;
 use anyhow::Result;
-use tracing::{warn, error, info, debug};
+use tracing::{warn, error, debug};
+
+// All Pump pool ATA derivations in this module — the fee wallet's quote-mint ATA and the
+// coin creator's vault ATA — target accounts that are always governed by the classic SPL
+// Token program. The single-argument form `get_associated_token_address(wallet, mint)` is
+// the correct call here: internally it fixes the token program seed to the classic SPL Token
+// program ID, which is the only valid program for these accounts in the Pump AMM protocol.
+// `spl_associated_token_account_interface` is the canonical source for this derivation —
+// its seed layout, program address, and bump-search strategy are guaranteed to match what
+// the on-chain Pump program computes for the same inputs.
+use spl_associated_token_account_interface::address::get_associated_token_address;
+
 
 pub fn parse_raydium_v4_pools(
     bank: &Arc<Bank>,
@@ -326,7 +337,7 @@ pub fn parse_pump_swap_pools(
             let wallet = pump_mayhem_fee_wallet();
             (
                 wallet,
-                crate::mev::constants::get_associated_token_address(
+                get_associated_token_address(
                     &wallet,
                     &amm_info.quote_mint,
                 ),
@@ -335,7 +346,7 @@ pub fn parse_pump_swap_pools(
             let wallet = pump_fee_wallet();
             (
                 wallet,
-                crate::mev::constants::get_associated_token_address(
+                get_associated_token_address(
                     &wallet,
                     &amm_info.quote_mint,
                 ),
@@ -343,7 +354,7 @@ pub fn parse_pump_swap_pools(
         };
 
         // The coin creator receives a portion of fees through their vault ATA for the quote mint.
-        let coin_creator_vault_ata = crate::mev::constants::get_associated_token_address(
+        let coin_creator_vault_ata = get_associated_token_address(
             &amm_info.coin_creator_vault_authority,
             &amm_info.quote_mint,
         );
@@ -1089,9 +1100,14 @@ pub fn parse_heaven_pools(
             token_base_vault,
             token_mint,
             base_mint,
-            // Heaven pools use standard SPL Token. The token_program field is retained
-            // in the struct for forward-compatibility if Heaven ever supports Token-2022.
-            token_program: crate::mev::constants::SPL_TOKEN_PROGRAM_ID,
+            // Heaven pools use standard SPL Token. `spl_token_interface::id()` returns the
+            // classic token program ID sourced from the `spl-token-interface` crate — a
+            // dedicated interface crate that exposes only program IDs and type definitions
+            // without pulling in the heavy implementation code. The `Pubkey` type it returns
+            // is the same workspace-versioned type used throughout this codebase, so no
+            // type coercion is needed. The field is retained for forward-compatibility if
+            // Heaven ever extends support to Token-2022 vaults.
+            token_program: spl_token_interface::id(),
         });
 
         debug!("Heaven pool added: {}", pool_addresses[idx]);
