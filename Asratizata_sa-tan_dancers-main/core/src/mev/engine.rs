@@ -1,5 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, RwLock};
+// libc provides the raw sched_setaffinity(2) syscall interface used to bind
+// each Tokio worker thread to a specific logical CPU at thread-start time.
+// The crate is a direct dependency of Agave itself so no Cargo.toml change
+// is required.
+use libc;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::Receiver;
@@ -7,7 +12,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_clock::Slot;
 pub use solana_ledger::blockstore_processor::MevExecutedBatch;
 use solana_runtime::bank::Bank;
-use solana_runtime::bank_forks::BankForks;
+use solana_runtime::bank_forks::{BankForks, ReadOnlyAtomicSlot};
 use solana_pubkey::Pubkey;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -25,11 +30,27 @@ use crate::mev::pools::MintPoolData;
 
 /// Maximum number of simulation tasks that may execute concurrently across ALL
 /// tracked mints.  A single `Arc<Semaphore>` with this many permits is shared
-/// by every `ArbitrageExecutor` in the engine.  When all permits are held,
-/// additional simulation tasks yield rather than spawn, capping the total MEV
-/// simulation load on the validator's CPU regardless of how many pool-update
-/// events arrive simultaneously.
-const MAX_CONCURRENT_SIMULATIONS: usize = 64;
+/// by every `ArbitrageExecutor` in the engine.
+///
+/// SVM simulation is purely CPU-bound — it runs the BPF interpreter, walks
+/// the bank's account cache, and processes compute units with no I/O and no
+/// blocking.  The true parallelism ceiling is therefore the number of physical
+/// cores dedicated to the MEV runtime, which on this machine is 12 (physical
+/// cores 12–23 of the Threadripper PRO 7965WX).  Running more than 12 tasks
+/// simultaneously does not increase throughput; it only increases context-switch
+/// overhead and L1/L2 cache pressure as tasks compete for the same execution
+/// units on the same physical core via SMT.
+///
+/// The permit count of 128 is intentionally larger than 12 to absorb burst
+/// traffic: up to 128 tasks may be queued waiting for a permit, but at most 12
+/// of them run on CPU at any instant.  This queue gives headroom during a sudden
+/// flood of pool-update events (e.g. a large batch touching many tracked mints
+/// simultaneously) without immediately dropping work.  Once the burst drains,
+/// the queue empties and permits return to idle.  Setting the cap much higher
+/// would allow stale tasks to accumulate behind live ones; the root-slot
+/// staleness guard in handle_mev_batch already prevents most stale work from
+/// reaching the semaphore, so 128 is a safe and sufficient ceiling.
+const MAX_CONCURRENT_SIMULATIONS: usize = 128;
 
 /// Maximum number of DetectedPool entries the engine holds in pending_ready at
 /// any one time.  Pool creation is permissionless — an adversary can spam
@@ -132,6 +153,22 @@ pub struct MevEngine {
     /// capital.
     validation_mode: bool,
     shredstream_url: String,
+    /// Lock-free read of the BankForks confirmed root slot.
+    ///
+    /// `ReadOnlyAtomicSlot` wraps the same `Arc<AtomicU64>` that `BankForks`
+    /// advances every time `ReplayStage` calls `set_root()`.  Reading it costs
+    /// exactly one `Ordering::Acquire` atomic load — no `RwLock`, no syscall,
+    /// no cache-line contention — making it safe and cheap to call on every
+    /// incoming batch in `handle_mev_batch`.
+    ///
+    /// Under Solana's supermajority confirmation rule the root always trails
+    /// the active working bank by roughly 32 slots.  The gap between the root
+    /// and a batch's slot therefore acts as a precise, zero-cost staleness
+    /// signal: a small gap (≤ ~32 slots) means the batch is live; a large gap
+    /// (thousands of slots) means the validator is still replaying historical
+    /// blocks during catchup and the batch carries prices the market has
+    /// already moved past.
+    root_slot: ReadOnlyAtomicSlot,
     simulation_semaphore: Arc<Semaphore>,
     /// Keyed on mint pubkey.  FxHashMap is used throughout because all keys are
     /// 32-byte Pubkeys, for which SipHash's collision resistance adds no security
@@ -215,6 +252,18 @@ impl MevEngine {
         let (bridge_dead_slot_tx, bridge_dead_slot_rx) =
             crossbeam_channel::unbounded::<Slot>();
 
+        // Obtain a lock-free handle to the confirmed root slot before the engine
+        // struct is constructed.  `get_atomic_root()` clones the `Arc<AtomicU64>`
+        // that BankForks already owns internally, so both the engine and BankForks
+        // point at the same atomic.  Every subsequent `ReplayStage::set_root()`
+        // call advances this value automatically — no further interaction with
+        // BankForks is needed to keep it current.  The read lock is held only
+        // for this single call; it is released before any registration work begins.
+        let root_slot = bank_forks
+            .read()
+            .expect("BankForks RwLock is poisoned at MEV engine construction")
+            .get_atomic_root();
+
         let mut engine = Self {
             mev_batch_rx,
             bank_rx,
@@ -231,6 +280,7 @@ impl MevEngine {
             min_profit_lamports,
             validation_mode,
             shredstream_url,
+            root_slot,
             simulation_semaphore,
             mint_states: FxHashMap::default(),
             account_to_mint: FxHashMap::default(),
@@ -446,14 +496,52 @@ impl MevEngine {
 
     /// Entry point called on the dedicated `"solMevEngine"` OS thread.
     ///
-    /// Creates a private 4-thread Tokio runtime for all MEV work.  Using a
-    /// separate runtime decouples MEV simulation scheduling from the validator's
-    /// main Tokio runtime so a saturated simulation queue cannot starve consensus,
-    /// replay, or banking tasks.
+    /// Creates a private Tokio runtime with 12 worker threads dedicated
+    /// exclusively to MEV simulation work.  This runtime is completely separate
+    /// from the validator's main Tokio runtime, which means a fully saturated
+    /// simulation queue cannot steal scheduler time from consensus, replay,
+    /// banking, or sigverify tasks running on the validator's runtime.
+    ///
+    /// # Physical core isolation
+    ///
+    /// The Threadripper PRO 7965WX has 24 physical cores with SMT (2 logical
+    /// threads per physical core), presenting 48 logical CPUs to the OS.
+    /// Linux numbers them such that physical core N owns logical CPUs N and N+24.
+    ///
+    /// This runtime pins each of its 12 worker threads to one unique logical CPU
+    /// in the range 12–23 via `sched_setaffinity(2)`, which correspond to
+    /// physical cores 12–23.  The validator and its Rayon thread pool are
+    /// configured separately to run on physical cores 0–11 (logical CPUs 0–11
+    /// and 24–35).  The two halves of the machine therefore never share a
+    /// physical core, which means they never fight over L1/L2 cache or execution
+    /// units regardless of what either side is doing at any given instant.
+    ///
+    /// We deliberately use only one logical CPU per physical core (12–23, not
+    /// also 36–47) for the MEV workers.  SVM simulation is a BPF interpreter
+    /// loop that is branch-heavy and makes dense reads from the bank's account
+    /// cache.  Two SMT siblings on the same physical core share the entire L1
+    /// and L2 cache: running two simulations on siblings causes them to
+    /// continuously evict each other's working set, halving effective cache
+    /// capacity per task.  One simulation per physical core keeps the full
+    /// 512 KiB L2 available to that task.
+    ///
+    /// # Why 12 threads
+    ///
+    /// Twelve threads means at most 12 simulations execute on CPU simultaneously,
+    /// one per dedicated physical core, with no SMT dilution and no cache
+    /// competition between MEV workers.  Adding more threads beyond 12 would not
+    /// increase throughput because all 12 physical cores would already be
+    /// saturated; it would only add context-switch overhead.
     pub fn run(self) {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            // One Tokio worker thread per physical core in the MEV partition.
+            // Physical cores 12–23 of the Threadripper PRO 7965WX are reserved
+            // exclusively for MEV simulation; the validator occupies cores 0–11.
+            .worker_threads(12)
             .thread_name_fn(|| {
+                // Each worker thread gets a unique sequential name visible in
+                // htop, perf, and system logs so MEV simulation threads can be
+                // identified and monitored independently of validator threads.
                 static ID: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 format!(
@@ -461,11 +549,72 @@ impl MevEngine {
                     ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 )
             })
+            .on_thread_start(|| {
+                // `on_thread_start` is invoked exactly once by each Tokio worker
+                // thread immediately after the OS creates it, before the thread
+                // enters the Tokio work-stealing loop.  This is the correct and
+                // only reliable hook for setting per-thread CPU affinity inside
+                // a Tokio multi-thread runtime.
+                //
+                // We assign each worker to a unique slot in the logical CPU range
+                // [12, 23].  The counter is module-global and atomic so concurrent
+                // thread starts (which Tokio may do in parallel) cannot race on
+                // the assignment.  With 12 worker threads and 12 available slots
+                // the mapping is always bijective: every worker gets exactly one
+                // core and every reserved core gets exactly one worker.
+                static NEXT_SLOT: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+
+                // Claim one slot in [0, 11] and map it to the corresponding
+                // logical CPU in [12, 23].  The modulo guards against the
+                // theoretical edge case where the counter wraps or Tokio spawns
+                // an unexpected extra thread — in that case the thread lands on
+                // an already-used core rather than escaping the reserved range.
+                let slot       = NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let logical_cpu = 12 + (slot % 12);
+
+                // sched_setaffinity(2) tells the kernel's CFS scheduler that this
+                // thread is permitted to run only on the listed CPU.  Once set,
+                // the scheduler will never migrate the thread to a different core,
+                // which preserves the hot working set in L1/L2 across consecutive
+                // task executions on the same thread.  The call takes a cpuset
+                // bitmask: we zero the entire mask and then set exactly one bit
+                // corresponding to our assigned logical CPU.
+                unsafe {
+                    let mut cpuset = std::mem::zeroed::<libc::cpu_set_t>();
+                    libc::CPU_SET(logical_cpu, &mut cpuset);
+                    let rc = libc::sched_setaffinity(
+                        // pid 0 means "the calling thread", which is exactly
+                        // the Tokio worker thread executing this closure.
+                        0,
+                        std::mem::size_of::<libc::cpu_set_t>(),
+                        &cpuset,
+                    );
+                    if rc != 0 {
+                        // Affinity failure is logged but not fatal.  If the OS
+                        // rejects the call (e.g. the process lacks CAP_SYS_NICE
+                        // or the CPU index is out of range for this kernel build)
+                        // the thread continues running unbound rather than
+                        // crashing the engine.  The operator should investigate
+                        // the error because unbound threads may drift onto
+                        // validator cores under heavy load.
+                        let errno = *libc::__errno_location();
+                        tracing::warn!(
+                            "solMevArb: sched_setaffinity failed for logical CPU {} \
+                             (errno {}); thread will run unbound",
+                            logical_cpu, errno,
+                        );
+                    }
+                }
+            })
             .enable_all()
             .build()
             .expect("failed to build MEV Tokio runtime");
 
-        info!("MevEngine: Tokio runtime created (4 worker threads)");
+        info!(
+            "MevEngine: Tokio runtime created (12 worker threads, \
+             pinned to logical CPUs 12–23 / physical cores 12–23)"
+        );
         rt.block_on(self.run_async());
         info!("MevEngine: Tokio runtime shut down");
     }
@@ -627,6 +776,33 @@ impl MevEngine {
     /// executor can call `simulate_transaction_unchecked` directly against it.
     fn handle_mev_batch(&mut self, batch: MevExecutedBatch) {
         let slot = batch.slot;
+
+        // The BankForks confirmed root is the highest slot that has received
+        // supermajority vote confirmation from the cluster.  Under normal
+        // Solana consensus this root trails the active working bank by roughly
+        // 32 slots — the time it takes for 2/3 of stake to vote and for those
+        // votes to themselves be rooted.
+        //
+        // During catchup replay the validator processes thousands of historical
+        // slots per second.  Each batch fired during replay carries a slot number
+        // from the past while the root has already advanced to the network tip,
+        // so the gap between root and batch.slot is in the thousands.  Those
+        // batches carry pool prices the market moved past long ago: simulating
+        // against them spawns tasks that consume semaphore permits, fill the
+        // Tokio task queue, and bury genuinely live events behind minutes of
+        // stale work — exactly the runaway latency observed in production.
+        //
+        // 150 slots of headroom above the normal ~32-slot lag absorbs transient
+        // cluster conditions (leader skips, network partitions, delayed votes)
+        // while remaining orders of magnitude below the thousands-of-slots gap
+        // that uniquely identifies catchup.  Any batch with a gap larger than
+        // 150 slots is discarded immediately — zero events broadcast, zero tasks
+        // spawned, semaphore untouched — so the engine arrives at the live tip
+        // with a completely clean queue and full semaphore budget.
+        if self.root_slot.get().saturating_sub(slot) > 150 {
+            return;
+        }
+
         let bank = &batch.bank;
         let blockhash = bank.last_blockhash();
 
