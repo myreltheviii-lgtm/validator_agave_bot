@@ -43,7 +43,7 @@ use {
         time::{Duration, Instant},
     },
     tokio::sync::{broadcast, Semaphore},
-    tracing::{info, warn},
+    tracing::{debug, info, warn},
 };
 
 /// Maximum microseconds a simulation task may wait from the moment its event
@@ -258,7 +258,7 @@ pub struct ArbitrageExecutor {
     /// Async HTTP client with a persistent connection pool to the Helius Sender relay.
     ///
     /// `reqwest::Client` internally manages a pool of TCP connections. Because our
-    /// submission requests all target the same `HELIUS_SENDER_AMS_ENDPOINT` host,
+    /// submission requests all target the same `HELIUS_SENDER_FRA_ENDPOINT` host,
     /// the pool keeps one (or more) TCP connections open and reuses them across
     /// successive `send_transaction` calls. The benefit is that we avoid the
     /// TCP three-way handshake (~0.2–0.5 ms over LAN) and the HTTP/1.1 pipeline
@@ -277,21 +277,34 @@ impl ArbitrageExecutor {
         rpc_client: Arc<solana_client::rpc_client::RpcClient>,
         base_priority_fee: u64,
         min_profit_lamports: u64,
+        // The http_client is constructed once in MevEngine and cloned (Arc-cheap)
+        // into every executor. This avoids the per-constructor allocation cost of
+        // HttpClient::new() — which was previously called for every mint registration,
+        // totalling millions of connection-pool allocations and causing the observed
+        // 8-minute startup. reqwest::Client is internally Arc-wrapped so clone() is
+        // a single atomic increment with no heap allocation.
+        http_client: HttpClient,
         jito_tip_lamports: u64,
         validation_mode: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         // Validate that the caller-supplied tip is at least the hard minimum required
         // by Helius Sender for Jito auction eligibility. Submitting below the minimum
         // would cause the relay to silently reject the Jito path — the transaction
         // would only travel via SWQOS, losing the dual-routing advantage.
-        assert!(
-            jito_tip_lamports >= HELIUS_SENDER_MIN_TIP_LAMPORTS,
-            "jito_tip_lamports ({}) must be >= HELIUS_SENDER_MIN_TIP_LAMPORTS ({})",
-            jito_tip_lamports,
-            HELIUS_SENDER_MIN_TIP_LAMPORTS,
-        );
+        //
+        // Returns Err rather than panicking so that a misconfigured tip on the runtime
+        // graduation path (register_mint) does not kill the engine thread. At startup
+        // (register_mint_startup) the caller uses expect() to fail-fast with a clear
+        // message before the validator begins processing live blocks.
+        if jito_tip_lamports < HELIUS_SENDER_MIN_TIP_LAMPORTS {
+            return Err(anyhow!(
+                "jito_tip_lamports ({}) must be >= HELIUS_SENDER_MIN_TIP_LAMPORTS ({})",
+                jito_tip_lamports,
+                HELIUS_SENDER_MIN_TIP_LAMPORTS,
+            ));
+        }
 
-        Self {
+        Ok(Self {
             arb_graph,
             pool_data,
             wallet,
@@ -300,13 +313,14 @@ impl ArbitrageExecutor {
             base_priority_fee,
             min_profit_lamports,
             jito_tip_lamports,
-            // `HttpClient::new()` creates the connection pool. No actual TCP connections
-            // are opened here — the pool is lazy and establishes connections on the first
-            // request to each host. After the first submission, the connection to the AMS
-            // endpoint stays open for the validator's lifetime.
-            http_client: HttpClient::new(),
+            // Connection pool established once by the caller (MevEngine::new). The pool
+            // is lazy — no TCP connection is opened until the first send_transaction call.
+            // After the first submission, the persistent connection to the FRA endpoint
+            // is reused for the validator's lifetime, eliminating the per-submission
+            // TCP handshake cost (~0.2–0.5 ms over LAN).
+            http_client,
             validation_mode,
-        }
+        })
     }
 
     pub fn pool_data_mint(&self) -> Pubkey {
@@ -355,6 +369,18 @@ impl ArbitrageExecutor {
         loop {
             match pool_update_rx.recv().await {
                 Ok(event) => {
+                    // `event.created_at` was stamped by the engine at the instant the
+                    // batch committed to the canonical bank — the true birth time of this
+                    // opportunity.  Using it for staleness guards ensures that an event
+                    // which sat in the broadcast ring buffer for 350 ms before being
+                    // dequeued here is already recognised as nearly stale when the spawned
+                    // task first checks.  Measuring from dequeue time instead would grant
+                    // that event a fresh 400 ms budget, letting the task acquire a semaphore
+                    // permit and run a full SVM simulation against market data the cluster
+                    // has already moved 350 ms past.  Using `event.created_at` closes that
+                    // gap: the elapsed time always reflects the true age of the opportunity
+                    // regardless of how long the event queued in the broadcast buffer or
+                    // how long the fan-out loop's graph-read window took to complete.
                     let pool_address = event.pool_address;
 
                     // Single read lock window: address → pair indices → path clones → pre-filter.
@@ -396,7 +422,7 @@ impl ArbitrageExecutor {
                         continue;
                     }
 
-                    info!(
+                    debug!(
                         "ArbitrageExecutor[{}]: pool {} affects {} qualifying pair(s)",
                         mint,
                         pool_address,
@@ -404,7 +430,6 @@ impl ArbitrageExecutor {
                     );
 
                     let event = Arc::new(event);
-                    let discovered_at = Instant::now();
 
                     for (pair_idx, path) in qualifying_pairs {
                         let self_clone = Arc::clone(&self);
@@ -416,14 +441,14 @@ impl ArbitrageExecutor {
                             //
                             // The Tokio task queue can back up under load: if many events
                             // arrive in a short window, spawned tasks wait here before they
-                            // are even scheduled to run.  By the time a task is first polled
-                            // by the runtime, `discovered_at` may already show an age that
-                            // exceeds one slot.  Simulating at that point would consume a
-                            // semaphore permit and CPU time for an opportunity the market
-                            // has already closed.  Returning here — before touching the
-                            // semaphore — costs nothing and keeps the permit pool fully
-                            // available for the next live event.
-                            if discovered_at.elapsed().as_micros() > MAX_EVENT_STALENESS_US {
+                            // are even scheduled to run.  `event_clone.created_at` carries
+                            // the batch-commit timestamp — the instant the pool price changed
+                            // on-chain — so this check fires as soon as the opportunity has
+                            // aged past one full slot (400 ms), regardless of how long the
+                            // event spent in the broadcast ring buffer or the task queue.
+                            // Returning here — before touching the semaphore — costs nothing
+                            // and keeps the permit pool fully available for the next live event.
+                            if event_clone.created_at.elapsed().as_micros() > MAX_EVENT_STALENESS_US {
                                 return;
                             }
 
@@ -442,13 +467,16 @@ impl ArbitrageExecutor {
                             // The task may have waited a non-trivial time in the semaphore
                             // queue — long enough for the event to cross the staleness
                             // threshold even though it was fresh when the pre-semaphore
-                            // check ran.  Returning here releases the permit immediately
-                            // so the next waiting task can acquire it, rather than holding
-                            // it through a full SVM simulation cycle against bank state
-                            // the market has already moved past.  The permit is an
-                            // OwnedSemaphorePermit and is dropped automatically when this
-                            // scope exits.
-                            if discovered_at.elapsed().as_micros() > MAX_EVENT_STALENESS_US {
+                            // check ran.  `event_clone.created_at` gives the true age from
+                            // batch-commit, so this guard fires correctly even when the
+                            // broadcast-buffer delay and the semaphore-queue delay together
+                            // push the total age past one slot.  Returning here releases the
+                            // permit immediately so the next waiting task can acquire it,
+                            // rather than holding it through a full SVM simulation cycle
+                            // against bank state the market has already moved past.  The
+                            // permit is an OwnedSemaphorePermit and drops automatically
+                            // when this scope exits.
+                            if event_clone.created_at.elapsed().as_micros() > MAX_EVENT_STALENESS_US {
                                 return;
                             }
 
@@ -457,7 +485,6 @@ impl ArbitrageExecutor {
                                     &path,
                                     &event_clone,
                                     pair_idx,
-                                    discovered_at,
                                     permit,
                                 )
                                 .await
@@ -536,7 +563,6 @@ impl ArbitrageExecutor {
         path: &ArbitragePath,
         event: &MevPoolUpdateEvent,
         pair_idx: usize,
-        discovered_at: Instant,
         simulation_permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<()> {
         // Load the current pool data with a single atomic pointer increment.
@@ -552,6 +578,13 @@ impl ArbitrageExecutor {
         // owned Arc holds the data alive for exactly as long as this simulation needs
         // it — no more, no less — while allowing the epoch to advance freely.
         let pool_data: Arc<MintPoolData> = self.pool_data.load_full();
+
+        // Cache the wallet pubkey once for the entire function.  self.wallet.pubkey()
+        // derives the public key from the signing key on every call — called four times
+        // across try_execute_arbitrage (sim message, WSOL pre/post scans, tip instruction,
+        // final message).  One binding here pays the derivation cost once and turns every
+        // downstream call into a plain Copy of a 32-byte stack value.
+        let wallet_pubkey = self.wallet.pubkey();
 
         // The bank arrives directly in the event, already committed.
         // `execute_batch()` in blockstore_processor clones `Arc<Bank>` into every
@@ -588,7 +621,7 @@ impl ArbitrageExecutor {
 
         let sim_message = self.lut_manager.create_v0_message(
             &sim_instructions,
-            &self.wallet.pubkey(),
+            &wallet_pubkey,
             event.blockhash,
         )?;
 
@@ -740,12 +773,14 @@ impl ArbitrageExecutor {
         // the wallet's ATA for the intermediate arb token.  Matching on mint alone would
         // also catch pool-owned WSOL accounts.  The conjunction uniquely identifies the
         // one entry that represents the wallet's settled WSOL balance.
+        // `wallet_pubkey` was cached once at the top of this function — used here and
+        // in the three other call sites (sim message, tip instruction, final message).
         let pre_wsol = sim_result
             .pre_token_balances
             .as_ref()
             .and_then(|v| {
                 v.iter()
-                    .find(|t| t.owner == self.wallet.pubkey() && t.mint == WSOL_MINT)
+                    .find(|t| t.owner == wallet_pubkey && t.mint == WSOL_MINT)
                     .map(|t| t.amount)
             })
             .unwrap_or(0);
@@ -755,7 +790,7 @@ impl ArbitrageExecutor {
             .as_ref()
             .and_then(|v| {
                 v.iter()
-                    .find(|t| t.owner == self.wallet.pubkey() && t.mint == WSOL_MINT)
+                    .find(|t| t.owner == wallet_pubkey && t.mint == WSOL_MINT)
                     .map(|t| t.amount)
             })
             .unwrap_or(0);
@@ -815,7 +850,14 @@ impl ArbitrageExecutor {
             return Ok(());
         }
 
-        let latency_us = discovered_at.elapsed().as_micros();
+        // `event.created_at` carries the batch-commit timestamp stamped by the engine
+        // the instant the pool state changed on-chain.  Using it here gives the true
+        // end-to-end latency: from the moment the opportunity was born (pool price
+        // changed) through simulation completion.  The `total=` field in the validation
+        // log therefore includes broadcast-buffer queuing time, Tokio task-queue wait,
+        // semaphore-queue wait, and SVM execution time — the complete picture of where
+        // microseconds are spent between opportunity birth and simulation result.
+        let latency_us = event.created_at.elapsed().as_micros();
 
         if self.validation_mode {
             // The simulation_permit drops here when this early return is reached —
@@ -911,7 +953,7 @@ impl ArbitrageExecutor {
         // `dynamic_tip` replaces the static `jito_tip_lamports` field here — the bid
         // is proportional to the simulated gross profit, rising with opportunity value.
         let tip_instruction = Self::build_sol_transfer_instruction(
-            self.wallet.pubkey(),
+            wallet_pubkey,
             tip_account,
             dynamic_tip,
         );
@@ -929,7 +971,7 @@ impl ArbitrageExecutor {
 
         let final_message = self.lut_manager.create_v0_message(
             &final_instructions,
-            &self.wallet.pubkey(),
+            &wallet_pubkey,
             event.blockhash,
         )?;
 
@@ -994,7 +1036,7 @@ impl ArbitrageExecutor {
     /// ## Connection warming
     ///
     /// `self.http_client` (a `reqwest::Client`) maintains a persistent connection pool.
-    /// After the first submission, the TCP connection to the AMS endpoint stays open
+    /// After the first submission, the TCP connection to the FRA endpoint stays open
     /// for keep-alive. Subsequent submissions reuse the open connection, skipping the
     /// handshake. The pool is transparent to this call site — `reqwest` selects an
     /// available connection from the pool automatically.

@@ -1,6 +1,6 @@
 use crate::mev::constants::SOL_MINT;
 use crate::mev::dex::byreal::byreal_program_id;
-use crate::mev::dex::futarchy::FutarchyInfo;
+use crate::mev::dex::futarchy::{FutarchyInfo, futarchy_program_id};
 use crate::mev::dex::heaven::HeavenPoolState;
 use crate::mev::dex::humidifi::HumidifiInfo;
 
@@ -1128,6 +1128,18 @@ pub fn parse_futarchy_pools(
     let sol = SOL_MINT;
     let mut results = Vec::new();
 
+    // event_authority is the Futarchy program's CPI event authority PDA. Anchor derives it
+    // from the seed `b"__event_authority"` under the program ID — the same derivation the
+    // on-chain program uses when it emits events via CPI. Because it depends only on the
+    // program ID (not on any per-pool state), it is identical for every Futarchy pool and
+    // must be computed once here rather than once per pool to avoid paying for up to 256
+    // SHA-256 hashes (find_program_address's bump search) on every iteration.
+    let futarchy_prog_id = futarchy_program_id();
+    let event_authority = Pubkey::find_program_address(
+        &[b"__event_authority"],
+        &futarchy_prog_id,
+    ).0;
+
     for (idx, pubkey) in pool_addresses.iter().enumerate() {
         let account = match bank.get_account(pubkey) {
             Some(acc) => acc,
@@ -1144,7 +1156,11 @@ pub fn parse_futarchy_pools(
             continue;
         }
 
-        let (token_x_vault, token_sol_vault) = if sol == info.base_mint {
+        // Vault assignment mirrors every other parser: the speculative token side goes into
+        // token_x_vault and the base/quote (SOL) side goes into token_base_vault. Named
+        // token_base_vault rather than token_sol_vault because Futarchy's quote side is not
+        // necessarily native SOL — it is whatever token the DAO configured as base at creation.
+        let (token_x_vault, token_base_vault) = if sol == info.base_mint {
             (info.quote_vault, info.base_vault)
         } else {
             (info.base_vault, info.quote_vault)
@@ -1159,8 +1175,9 @@ pub fn parse_futarchy_pools(
         results.push(FutarchyPool {
             // Futarchy identifies its pool by the DAO account, not a separate pool address.
             dao: pool_addresses[idx],
+            event_authority,
             token_x_vault,
-            token_sol_vault,
+            token_base_vault,
             token_mint,
             base_mint,
         });

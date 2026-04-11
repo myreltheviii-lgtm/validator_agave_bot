@@ -1,5 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 // libc provides the raw sched_setaffinity(2) syscall interface used to bind
 // each Tokio worker thread to a specific logical CPU at thread-start time.
 // The crate is a direct dependency of Agave itself so no Cargo.toml change
@@ -18,9 +19,15 @@ use solana_keypair::Keypair;
 use solana_signer::Signer;
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{debug, error, info, warn};
+// reqwest::Client is constructed once in MevEngine::new() and cloned (Arc-cheap)
+// into every ArbitrageExecutor. A single shared connection pool means all executors
+// reuse TCP connections to the Helius Sender FRA relay rather than each opening
+// their own — avoiding both the per-constructor allocation and the per-submission
+// handshake cost.
+use reqwest::Client as HttpClient;
 
 use crate::mev::arbitrage::{ArbitrageGraph, ArbitrageGraphConfig, MevPoolUpdateEvent, PoolInfo, PoolType};
-use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
+use crate::mev::constants::SOL_MINT;
 use crate::mev::executor::ArbitrageExecutor;
 use crate::mev::loaders::pool_discovery::initialize_mint_from_discovered;
 use crate::mev::loaders::pool_graduation::{DetectedPool, GraduationSource};
@@ -162,8 +169,20 @@ pub struct MevEngine {
     /// auction, with this value as the absolute minimum to maintain dual-routing
     /// eligibility through Helius Sender.  Must be at least
     /// `HELIUS_SENDER_MIN_TIP_LAMPORTS` (200_000 lamports / 0.0002 SOL) or the
-    /// executor will panic at construction time.
+    /// executor will return an error at construction time.
     jito_tip_lamports: u64,
+    /// Shared async HTTP client passed to every `ArbitrageExecutor` at construction.
+    ///
+    /// `reqwest::Client` is an `Arc`-wrapped connection pool — `clone()` is a single
+    /// atomic increment with no heap allocation.  Constructing it once here and
+    /// cloning into each executor means all executors share the same underlying pool
+    /// and reuse established TCP connections to the Helius Sender FRA relay rather
+    /// than each opening separate connections.  The previous approach of calling
+    /// `HttpClient::new()` inside `ArbitrageExecutor::new()` allocated a full
+    /// connection pool per executor — with ~2.1 M mints registered at startup that
+    /// produced millions of pool-object allocations sequentially, causing the
+    /// observed 8-minute startup delay.
+    http_client: HttpClient,
     /// Lock-free read of the BankForks confirmed root slot.
     ///
     /// `ReadOnlyAtomicSlot` wraps the same `Arc<AtomicU64>` that `BankForks`
@@ -295,6 +314,10 @@ impl MevEngine {
             shredstream_url,
             root_slot,
             simulation_semaphore,
+            // Single connection pool shared across all executors. Clone into each
+            // ArbitrageExecutor is one atomic increment — no heap allocation. The pool
+            // is lazy: no TCP connection is opened until the first send_transaction call.
+            http_client: HttpClient::new(),
             mint_states: FxHashMap::default(),
             account_to_mint: FxHashMap::default(),
             pending_executor_starts: Vec::new(),
@@ -373,17 +396,31 @@ impl MevEngine {
         // so it can be driven by the pending_executor_starts mechanism in run_async.
         let (pool_update_tx, pool_update_rx) = broadcast::channel(1024);
 
-        let executor = Arc::new(ArbitrageExecutor::new(
-            Arc::clone(&arb_graph),
-            Arc::clone(&pool_data_swap),
-            Arc::clone(&self.wallet),
-            Arc::clone(&self.lut_manager),
-            Arc::clone(&self.rpc_client),
-            self.base_priority_fee,
-            self.min_profit_lamports,
-            self.jito_tip_lamports,
-            self.validation_mode,
-        ));
+        let executor = Arc::new(
+            match ArbitrageExecutor::new(
+                Arc::clone(&arb_graph),
+                Arc::clone(&pool_data_swap),
+                Arc::clone(&self.wallet),
+                Arc::clone(&self.lut_manager),
+                Arc::clone(&self.rpc_client),
+                self.base_priority_fee,
+                self.min_profit_lamports,
+                // Clone is a single Arc refcount increment — no allocation.
+                self.http_client.clone(),
+                self.jito_tip_lamports,
+                self.validation_mode,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        "MevEngine: ArbitrageExecutor construction failed for mint {} \
+                         (tip config invalid) — mint skipped: {}",
+                        mint, e
+                    );
+                    return;
+                }
+            }
+        );
 
         self.pending_executor_starts.push((executor, pool_update_rx));
 
@@ -468,17 +505,26 @@ impl MevEngine {
 
         let pool_data_swap = Arc::new(ArcSwap::from(pool_data));
 
-        let executor = Arc::new(ArbitrageExecutor::new(
-            Arc::clone(&arb_graph),
-            Arc::clone(&pool_data_swap),
-            Arc::clone(&self.wallet),
-            Arc::clone(&self.lut_manager),
-            Arc::clone(&self.rpc_client),
-            self.base_priority_fee,
-            self.min_profit_lamports,
-            self.jito_tip_lamports,
-            self.validation_mode,
-        ));
+        let executor = Arc::new(
+            // At startup jito_tip_lamports has already been validated by the operator
+            // before the engine is constructed — an Err here indicates a programming
+            // error in the caller's config assembly, so expect() is appropriate for
+            // fail-fast detection before live blocks arrive.
+            ArbitrageExecutor::new(
+                Arc::clone(&arb_graph),
+                Arc::clone(&pool_data_swap),
+                Arc::clone(&self.wallet),
+                Arc::clone(&self.lut_manager),
+                Arc::clone(&self.rpc_client),
+                self.base_priority_fee,
+                self.min_profit_lamports,
+                // Clone is a single Arc refcount increment — no allocation.
+                self.http_client.clone(),
+                self.jito_tip_lamports,
+                self.validation_mode,
+            )
+            .expect("ArbitrageExecutor construction failed at startup — check jito_tip_lamports config")
+        );
 
         self.pending_executor_starts.push((executor, pool_update_rx));
 
@@ -503,7 +549,12 @@ impl MevEngine {
             },
         );
 
-        info!(
+        // debug! not info! — called once per registered mint at startup.
+        // With millions of mints this would produce millions of info-level log
+        // lines and millions of format-string allocations, measurably slowing
+        // startup.  debug! is filtered at the subscriber level when debug logging
+        // is not enabled, costing only a single branch check per call.
+        debug!(
             "MevEngine: registered mint {} ({} tracked accounts)",
             mint, tracked_count
         );
@@ -870,6 +921,12 @@ impl MevEngine {
                             pool_address: *account_key,
                             bank: Arc::clone(bank),
                             blockhash,
+                            // Stamp the batch-commit time as the event's true origin.
+                            // The executor uses created_at.elapsed() for both staleness
+                            // guards and the end-to-end latency log field. Measuring from
+                            // dequeue time in the fan-out loop understates event age when
+                            // events sit in the broadcast ring buffer under load.
+                            created_at: Instant::now(),
                         };
 
                         match state.pool_update_tx.send(event) {
@@ -994,8 +1051,11 @@ impl MevEngine {
         }
 
         // Identify which token is the speculative (non-quote) side of this pool.
+        // The arb model is SOL-only: SOL is the sole quote currency. Any pool whose
+        // both sides are non-SOL is rejected — the speculative mint selection below
+        // would otherwise yield a quote token as the intermediate, corrupting the graph.
         let is_quote = |m: &Pubkey| -> bool {
-            *m == SOL_MINT || *m == USDC_MINT || *m == USDT_MINT || *m == USD1_MINT
+            *m == SOL_MINT
         };
 
         let mint = if !is_quote(&detected.mint0) {
@@ -1042,11 +1102,12 @@ impl MevEngine {
                 bank,
             ) {
                 Ok(init) => {
-                    let temp_graph = ArbitrageGraph::build_with_config(
-                        &init.pool_data,
-                        ArbitrageGraphConfig::default(),
-                    );
-                    let accounts = temp_graph.all_tracked_accounts();
+                    // The only new account to track is the pool address itself. Building
+                    // a full ArbitrageGraph for a single-pool MintPoolData just to call
+                    // all_tracked_accounts() allocated an entire graph structure, ran the
+                    // pair-building loop, and then discarded everything except one pubkey.
+                    // The direct vec avoids all of that work.
+                    let accounts = vec![detected.pool_address];
 
                     {
                         let state = self.mint_states.get(&mint).unwrap();

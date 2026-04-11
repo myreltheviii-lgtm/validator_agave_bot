@@ -24,9 +24,9 @@ use crate::mev::dex::humidifi::humidifi_program_id;
 use crate::mev::dex::vertigo::vertigo_program_id;
 use crate::mev::dex::heaven::constants::{heaven_program_id, heaven_protocol_account_1, heaven_protocol_account_2};
 use crate::mev::dex::futarchy::futarchy_program_id;
-// All four quote-token mints come from the canonical constant module so they are
+// SOL_MINT and USDC_MINT come from the canonical constant module so they are
 // guaranteed to match what token_flow_validator.rs and arbitrage_graph.rs use.
-use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
+use crate::mev::constants::{SOL_MINT, USDC_MINT};
 use crate::mev::executor::token_flow_validator::TokenFlowStep;
 // An Associated Token Account (ATA) is a Program Derived Address — a deterministic,
 // off-curve address that no private key controls — derived from the triple
@@ -57,28 +57,20 @@ impl SmbInstructionBuilder {
     ///
     /// The SMB executor requires that the two pools form a genuine arb pair: they must share
     /// the same two tokens in some order, and the intermediate token (the one traded in the
-    /// middle of the two-hop sequence) must not itself be a quote currency. A path between
-    /// two SOL↔USDC pools would have no intermediate speculative token to trade, and the
-    /// on-chain program has no routing logic for quote-to-quote hops.
-    ///
-    /// The quote-currency set is: SOL, USDC, USDT, USD1. All four are excluded from the
-    /// intermediate position because the executor's flashloan can only source and return
-    /// capital in these denominations — treating one of them as the "speculative" token
-    /// in the middle would mean the executor both sources and receives the same stablecoin,
-    /// which is a no-op and cannot generate profit.
+    /// middle of the two-hop sequence) must not itself be a quote currency. The arb model is
+    /// SOL-only — SOL is the sole quote currency. A path whose intermediate token is SOL would
+    /// mean the executor both sources and receives SOL for both legs, which is a no-op and
+    /// cannot generate profit.
     pub fn can_execute_2hop(path: &ArbitragePath) -> bool {
         let ArbitragePath::TwoHop { pool_1, pool_2, intermediate_token } = path;
 
         let same_pair = (pool_1.token_x == pool_2.token_x && pool_1.token_y == pool_2.token_y) ||
             (pool_1.token_x == pool_2.token_y && pool_1.token_y == pool_2.token_x);
 
-        // All four recognised quote currencies are ineligible as the intermediate token.
-        // SOL_MINT, USDC_MINT, USDT_MINT, and USD1_MINT are compile-time Pubkey constants
-        // imported from crate::mev::constants — no runtime base58 decode occurs here.
-        let is_speculative_intermediate = *intermediate_token != SOL_MINT
-            && *intermediate_token != USDC_MINT
-            && *intermediate_token != USDT_MINT
-            && *intermediate_token != USD1_MINT;
+        // SOL is the only quote currency in the SOL-only arb model. An intermediate
+        // token that equals SOL_MINT would route through a SOL→SOL→SOL path — a structural
+        // no-op that cannot profit and would fail the on-chain profit floor check.
+        let is_speculative_intermediate = *intermediate_token != SOL_MINT;
 
         same_pair && is_speculative_intermediate
     }
@@ -137,11 +129,10 @@ impl SmbInstructionBuilder {
 
         let base_mint = token_flow[0].base_mint;
 
-        // SOL_MINT, USDC_MINT, and USD1_MINT are compile-time Pubkey constants from
-        // crate::mev::constants. No runtime base58 decode occurs here.
+        // USDC_MINT is a compile-time Pubkey constant from crate::mev::constants.
+        // No runtime base58 decode occurs here. SOL_MINT is referenced directly
+        // from the constant where needed; no local binding is required.
         let usdc_mint = USDC_MINT;
-        let sol_mint  = SOL_MINT;
-        let usd1_mint = USD1_MINT;
 
         debug!("BASE_MINT: {}", base_mint);
         debug!("IS_USDC_BASE: {}", base_mint == usdc_mint);
@@ -235,64 +226,6 @@ impl SmbInstructionBuilder {
             debug!("Flashloan accounts added");
         }
 
-        // Mixed stablecoin mode activates when the global base is SOL but one or more
-        // individual pool legs quote in USDC or USD1. In that case the executor needs a
-        // bridge Raydium V4 pool (SOL↔USDC or SOL↔USD1) so it can convert between the
-        // two denominations mid-arb. Detection must examine the base_mint field stored on
-        // each pool struct for only the pools actually in the current path — not all pools
-        // in pool_data. Scanning all pools would inject bridge accounts into transactions
-        // for any token that happens to have a USDC pool anywhere in pool_data, even when
-        // neither leg of the current two-hop path is USDC-denominated. That shifts every
-        // account index in the affected transactions and causes guaranteed on-chain failure.
-        let mut has_usdc_base = false;
-        let mut has_usd1_base = false;
-
-        for step in token_flow.iter() {
-            if let Some(pool_base_mint) = Self::find_pool_base_mint(&step.pool, pool_data) {
-                if pool_base_mint == usdc_mint { has_usdc_base = true; }
-                if pool_base_mint == usd1_mint { has_usd1_base = true; }
-            }
-        }
-
-        // Bridge insertion is gated on base_mint == SOL. If the global base is already USDC
-        // all pools are USDC-denominated and no bridge is required.
-        if base_mint == sol_mint && has_usdc_base {
-            debug!("MIXED MODE: Adding SOL<>USDC bridge accounts");
-            let wallet_usdc_account = get_associated_token_address(&wallet.pubkey(), &usdc_mint);
-            let raydium_sol_usdc_pool = solana_pubkey::pubkey!("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2");
-            // HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz is the USDC vault of this pool.
-            // DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz is the SOL (wSOL) vault.
-            // The executor expects them in this exact order: USDC vault first, SOL vault second.
-            let raydium_usdc_vault = solana_pubkey::pubkey!("HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz");
-            let raydium_sol_vault  = solana_pubkey::pubkey!("DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz");
-            let sysvar_instructions = SYSVAR_INSTRUCTIONS_ID;
-
-            accounts.push(AccountMeta::new_readonly(usdc_mint, false));
-            accounts.push(AccountMeta::new(wallet_usdc_account, false));
-            accounts.push(AccountMeta::new_readonly(raydium_program_id(), false));
-            accounts.push(AccountMeta::new_readonly(raydium_authority(), false));
-            accounts.push(AccountMeta::new_readonly(sysvar_instructions, false));
-            accounts.push(AccountMeta::new(raydium_sol_usdc_pool, false));
-            accounts.push(AccountMeta::new(raydium_usdc_vault, false));
-            accounts.push(AccountMeta::new(raydium_sol_vault, false));
-        } else if base_mint == sol_mint && has_usd1_base {
-            debug!("MIXED MODE: Adding SOL<>USD1 bridge accounts");
-            let wallet_usd1_account = get_associated_token_address(&wallet.pubkey(), &usd1_mint);
-            let raydium_sol_usd1_pool = solana_pubkey::pubkey!("FaDoeere161VKUFqcrQEM8it6kSCHKrLyq7wWyPvBkPq");
-            let raydium_usd1_vault = solana_pubkey::pubkey!("GLx7TdT66CPKYJBn3Pzc9khrfXEx6mXtAiE8uskGBQJq");
-            let raydium_sol_vault  = solana_pubkey::pubkey!("3U9HB8KNHXmAmiGMbDsj6fBxzM63dfX5JbaYs5oTHbtu");
-            let sysvar_instructions = SYSVAR_INSTRUCTIONS_ID;
-
-            accounts.push(AccountMeta::new_readonly(usd1_mint, false));
-            accounts.push(AccountMeta::new(wallet_usd1_account, false));
-            accounts.push(AccountMeta::new_readonly(raydium_program_id(), false));
-            accounts.push(AccountMeta::new_readonly(raydium_authority(), false));
-            accounts.push(AccountMeta::new_readonly(sysvar_instructions, false));
-            accounts.push(AccountMeta::new(raydium_sol_usd1_pool, false));
-            accounts.push(AccountMeta::new(raydium_usd1_vault, false));
-            accounts.push(AccountMeta::new(raydium_sol_vault, false));
-        }
-
         accounts.push(AccountMeta::new_readonly(pool_data.mint, false));
         accounts.push(AccountMeta::new_readonly(pool_data.token_program, false));
 
@@ -362,43 +295,6 @@ impl SmbInstructionBuilder {
         }
 
         debug!("Total accounts: {}", accounts.len());
-
-        // [DEBUG — REMOVE AFTER DIAGNOSIS]
-        // Pre-flight owner scan: ask the bank whether every account in the list
-        // actually exists on-chain and who owns it, before spending any compute
-        // units on simulation. The Solana runtime raises IllegalOwner when the
-        // SMB program's account-validation prologue finds an account whose owner
-        // field is the System Program rather than a token program. This most
-        // commonly happens for the wallet's intermediate token ATA on speculative
-        // mints the wallet has never traded — the ATA does not exist on-chain yet,
-        // so its implicit owner is the System Program. The scan runs at the call
-        // site that has the complete, ordered account list, so the index printed
-        // here is the exact index the SMB validator will reject. A None result
-        // means the account does not exist at all; a Some result with owner
-        // 11111...1 confirms an uninitialized (never-created) ATA.
-        for (i, account_meta) in accounts.iter().enumerate() {
-            match bank.get_account(&account_meta.pubkey) {
-                None => {
-                    info!(
-                        "PRE-SIM[{}]: account[{}] {} does NOT EXIST on-chain — \
-                         uninitialized ATA or missing PDA; this is the account \
-                         the SMB validator will reject with IllegalOwner",
-                        pool_data.mint, i, account_meta.pubkey
-                    );
-                }
-                Some(account) => {
-                    if *account.owner() == solana_sdk_ids::system_program::id() {
-                        info!(
-                            "PRE-SIM[{}]: account[{}] {} EXISTS but is owned by \
-                             SystemProgram — ATA was never initialized with a token \
-                             program; SMB validator will reject with IllegalOwner",
-                            pool_data.mint, i, account_meta.pubkey
-                        );
-                    }
-                }
-            }
-        }
-        // [END DEBUG]
 
         // Instruction layout (17 bytes total):
         // [0]     opcode = 28u8
@@ -591,9 +487,13 @@ impl SmbInstructionBuilder {
         accounts: &mut Vec<AccountMeta>,
         pool_info: &PoolInfo,
         pool_data: &MintPoolData,
-        wallet: &Pubkey,
+        // Both PDAs that previously required the wallet pubkey and token mint at build time
+        // (user_volume_accumulator, pool_v2) are now pre-computed at parse time in
+        // pool_parser::parse_pump_swap_pools and stored directly on PumpPool.
+        // These params are retained in the signature for forward-compatibility.
+        _wallet: &Pubkey,
         base_mint: &Pubkey,
-        token_mint: &Pubkey,
+        _token_mint: &Pubkey,
     ) -> Result<()> {
         debug!("ADD_PUMP_ACCOUNTS: {}", pool_info.address);
         let pool = pool_data.pump_pools.iter()
@@ -769,65 +669,44 @@ impl SmbInstructionBuilder {
 
         accounts.push(AccountMeta::new_readonly(whirlpool_program_id(), false));
         accounts.push(AccountMeta::new_readonly(*base_mint, false));
-
-        // Whirlpool unconditionally requires the SPL Memo program in every swap, regardless
-        // of whether the token uses Token-2022 or plain SPL Token. The program embeds a memo
-        // CPI into its swap instruction to satisfy downstream composability requirements.
-        let memo = MEMO_PROGRAM_ID;
-        accounts.push(AccountMeta::new_readonly(memo, false));
-
+        // Orca Whirlpool unconditionally requires the SPL Memo program in every swap
+        // instruction regardless of token standard. The field is always Some(...) because
+        // it was set at parse time.
+        if let Some(memo) = pool.memo_program {
+            accounts.push(AccountMeta::new_readonly(memo, false));
+        }
         accounts.push(AccountMeta::new(pool.pool, false));
-        // The oracle account is WRITABLE for Whirlpool because the program updates the
-        // time-weighted average price (TWAP) data on every swap.
         accounts.push(AccountMeta::new(pool.oracle, false));
         accounts.push(AccountMeta::new(pool.x_vault, false));
         accounts.push(AccountMeta::new(pool.y_vault, false));
 
-        // Tick arrays are re-derived from the live tick at instruction build time for the
-        // same reason as CLMM — price movement since init may have shifted the active tick
-        // into a different set of arrays.
-        let live_tick_arrays = Self::calculate_live_whirlpool_tick_arrays(&pool.pool, bank)?;
-        debug!("Calculated {} tick arrays", live_tick_arrays.len());
-        for tick_array in &live_tick_arrays {
-            accounts.push(AccountMeta::new(*tick_array, false));
-        }
+        // Re-derive tick arrays from the live whirlpool state at instruction build time.
+        // Reading the bank here gives us the tick_current_index and tick_spacing that
+        // reflect the pool's state at the moment the transaction is being built, not the
+        // stale values cached at parse time. Tick arrays that were valid at startup may
+        // no longer cover the current tick if the pool has drifted since initialisation.
+        let account = bank.get_account(&pool.pool)
+            .ok_or_else(|| anyhow::anyhow!("Whirlpool {} not found in bank", pool.pool))?;
+        // try_deserialize validates the eight-byte Anchor discriminator before decoding.
+        // The `&mut &[u8]` cursor pattern advances through the raw bytes without
+        // allocating — `account.data()` is a direct borrow from the bank's in-memory store.
+        let mut slice = account.data();
+        let whirlpool_state = Whirlpool::try_deserialize(&mut slice)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Whirlpool state: {:?}", e))?;
+        // update_tick_array_accounts_for_onchain derives the three tick array PDAs that
+        // bracket the current tick and returns them as AccountMeta values with the correct
+        // writable flags already set. Extending accounts directly avoids re-allocating
+        // AccountMeta structs and keeps the hot path allocation-free past this point.
+        let live_tick_arrays = update_tick_array_accounts_for_onchain(
+            &whirlpool_state,
+            &pool.pool,
+            &whirlpool_program_id(),
+        );
+        debug!("Calculated {} tick arrays for Whirlpool", live_tick_arrays.len());
+        accounts.extend(live_tick_arrays);
 
         debug!("ORCA_WHIRLPOOL accounts added successfully");
         Ok(())
-    }
-
-    // Produces exactly 3 tick array pubkeys for a Whirlpool swap. update_tick_array_accounts_for_onchain
-    // returns the arrays at the current position and one step to each side — the same three that
-    // the Orca SDK generates. The on-chain executor reads exactly 3 tick array account slots;
-    // supplying more or fewer desynchronises the executor's hard-coded account offsets and causes
-    // every Whirlpool transaction to fail with an invalid account index error.
-    fn calculate_live_whirlpool_tick_arrays(
-        pool_address: &Pubkey,
-        bank: &Arc<Bank>,
-    ) -> Result<Vec<Pubkey>> {
-        let account = bank.get_account(pool_address)
-            .ok_or_else(|| anyhow::anyhow!("Whirlpool {} not found in bank at slot {}", pool_address, bank.slot()))?;
-
-        // `try_deserialize` validates the Anchor eight-byte discriminator at the front of the
-        // account data before decoding the pool fields. Its `buf: &mut &[u8]` cursor advances
-        // through the raw bytes as each field is read. This function sits on the hot path —
-        // it executes for every arb attempt that involves a Whirlpool leg. Borrowing directly
-        // from `AccountSharedData::data()` and binding to a `mut` local variable gives the
-        // required `&mut &[u8]` cursor without allocating a new Vec or copying bytes off the heap.
-        let mut slice = account.data();
-        let whirlpool = Whirlpool::try_deserialize(&mut slice)
-            .map_err(|e| anyhow::anyhow!("Failed to parse Whirlpool state: {:?}", e))?;
-
-        let whirlpool_prog_id = whirlpool_program_id();
-        let tick_array_metas = update_tick_array_accounts_for_onchain(
-            &whirlpool,
-            pool_address,
-            &whirlpool_prog_id,
-        );
-
-        let pubkeys: Vec<Pubkey> = tick_array_metas.iter().map(|meta| meta.pubkey).collect();
-        debug!("Generated {} tick array pubkeys for Whirlpool {}", pubkeys.len(), pool_address);
-        Ok(pubkeys)
     }
 
     fn add_byreal_accounts(
@@ -992,9 +871,14 @@ impl SmbInstructionBuilder {
 
         accounts.push(AccountMeta::new_readonly(futarchy_program_id(), false));
         accounts.push(AccountMeta::new_readonly(*base_mint, false));
+        // event_authority is the Futarchy program's CPI event authority PDA. It must
+        // appear at this exact position — third account after program_id and base_mint —
+        // matching the layout verified against transaction.rs. Omitting it shifts every
+        // subsequent account left by one slot, causing guaranteed on-chain rejection.
+        accounts.push(AccountMeta::new_readonly(pool.event_authority, false));
         accounts.push(AccountMeta::new(pool.dao, false));
         accounts.push(AccountMeta::new(pool.token_x_vault, false));
-        accounts.push(AccountMeta::new(pool.token_sol_vault, false));
+        accounts.push(AccountMeta::new(pool.token_base_vault, false));
 
         debug!("FUTARCHY accounts added successfully");
         Ok(())

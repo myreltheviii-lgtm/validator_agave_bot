@@ -193,8 +193,18 @@ pub struct FutarchyPool {
     // Futarchy uses a DAO account as the pool anchor rather than a pool address.
     // The dao pubkey acts as the canonical identifier for this pool.
     pub dao: Pubkey,
+    // event_authority is the Futarchy program's CPI event authority PDA. The on-chain
+    // executor requires it as the third account in every swap instruction — one slot
+    // after base_mint. Missing this account shifts every subsequent account left by one
+    // index and causes the program to reject the transaction with a mismatched account
+    // error before any swap logic executes.
+    pub event_authority: Pubkey,
     pub token_x_vault: Pubkey,
-    pub token_sol_vault: Pubkey,
+    // token_base_vault holds the base-side (quote) liquidity for this pool. Named
+    // token_base_vault rather than token_sol_vault because Futarchy's base token is
+    // not necessarily SOL — it is whatever quote currency the DAO configured at pool
+    // creation. The field name matches the reference implementation in transaction.rs.
+    pub token_base_vault: Pubkey,
     pub token_mint: Pubkey,
     pub base_mint: Pubkey,
 }
@@ -471,9 +481,9 @@ impl MintPoolData {
             pool,
             amm_config,
             observation_state,
+            bitmap_extension,
             x_vault,
             y_vault,
-            bitmap_extension,
             tick_arrays,
             memo_program,
             token_mint,
@@ -574,15 +584,17 @@ impl MintPoolData {
     pub fn add_futarchy_pool(
         &mut self,
         dao: Pubkey,
+        event_authority: Pubkey,
         token_x_vault: Pubkey,
-        token_sol_vault: Pubkey,
+        token_base_vault: Pubkey,
         token_mint: Pubkey,
         base_mint: Pubkey,
     ) {
         self.futarchy_pools.push(FutarchyPool {
             dao,
+            event_authority,
             token_x_vault,
-            token_sol_vault,
+            token_base_vault,
             token_mint,
             base_mint,
         });

@@ -1,12 +1,14 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use solana_pubkey::Pubkey;
+use std::time::Instant;
 use tracing::info;
 
-// Quote-token constants are centralised in crate::mev::constants and imported here
-// instead of being redeclared locally. Duplicate declarations create a drift hazard:
-// if the authoritative constant in constants.rs is ever corrected (as USD1 was), a
-// local shadowing definition would silently persist with the stale value.
-use crate::mev::constants::{SOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT};
+// SOL_MINT is the only quote currency in the arb model. USDC, USDT, and USD1 pools
+// are excluded from the graph entirely: their swap programs require stablecoin-specific
+// instruction layouts that the SOL-only SMB executor does not support, and treating
+// them as quote currencies would allow stablecoin-to-stablecoin paths into the graph
+// that produce zero arb profit by construction.
+use crate::mev::constants::SOL_MINT;
 
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,17 @@ pub struct MevPoolUpdateEvent {
     /// transaction references a recent valid blockhash without a separate
     /// bank read inside the executor.
     pub blockhash: solana_hash::Hash,
+
+    /// Wall-clock instant at which `handle_mev_batch` stamped this event,
+    /// immediately after the batch committed. This is the true origin time of
+    /// the opportunity: the moment the relevant pool state changed on-chain.
+    ///
+    /// The executor uses `created_at.elapsed()` for both staleness guards and
+    /// the `total=` latency log field, giving an accurate end-to-end measure
+    /// from batch commit through simulation completion. Measuring from dequeue
+    /// time instead (as `Instant::now()` in the fan-out loop would do) would
+    /// understate age for events that sat in the broadcast ring buffer.
+    pub created_at: Instant,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
@@ -161,17 +174,12 @@ pub struct PoolPair {
 
 impl PoolPair {
     pub fn to_path(&self) -> ArbitragePath {
-        // Select the non-quote token as the intermediate. A valid two-hop arbitrage path
-        // starts and ends at the same quote currency (SOL, USDC, USDT, or USD1) and passes
-        // through exactly one speculative token in the middle. If shared_token_a is one of
-        // the four recognised quote currencies, shared_token_b must be the speculative token,
-        // and vice versa. Both tokens in a pair are guaranteed to differ, so exactly one of
-        // the two will be non-quote.
-        let intermediate_token = if self.shared_token_a != SOL_MINT
-            && self.shared_token_a != USDC_MINT
-            && self.shared_token_a != USDT_MINT
-            && self.shared_token_a != USD1_MINT
-        {
+        // The arb model is SOL-only: the quote currency is always SOL and the
+        // intermediate token is always the non-SOL side of the pair. If shared_token_a
+        // is SOL, shared_token_b is the intermediate speculative token, and vice versa.
+        // Both tokens in a pair are guaranteed to differ, so exactly one of the two
+        // will be non-SOL.
+        let intermediate_token = if self.shared_token_a != SOL_MINT {
             self.shared_token_a
         } else {
             self.shared_token_b
@@ -227,20 +235,17 @@ pub struct ArbitrageGraph {
     config: ArbitrageGraphConfig,
 }
 
-// Returns true when the token is one of the four recognised quote currencies.
-// Quote currencies are the denominators in which arbitrage profit is measured.
-// Any token that is NOT a quote currency is a speculative (intermediate) token.
+// Returns true when the token is the SOL quote currency.
+// SOL is the only supported arb denomination. Pools whose both sides are non-SOL
+// (e.g. USDC/USDT stablecoin pairs) are excluded from the graph because the
+// SOL-only SMB executor has no routing path for non-SOL base capital.
 fn is_quote_token(token: &Pubkey) -> bool {
     *token == SOL_MINT
-        || *token == USDC_MINT
-        || *token == USDT_MINT
-        || *token == USD1_MINT
 }
 
-// Returns true if at least one side of the pool is a quote currency. Only pools
-// that have a quote side can participate in two-hop arbitrage because the executor
-// needs to borrow the quote currency, trade into the intermediate token, and trade
-// back — which requires one leg of each pool to be the same quote currency.
+// Returns true if at least one side of the pool is SOL. Only SOL-base pools can
+// participate in two-hop arbitrage because the executor sources and returns capital
+// in SOL — one leg of each pool must be SOL for the round-trip to close.
 fn pool_has_quote(pool: &PoolInfo) -> bool {
     is_quote_token(&pool.token_x) || is_quote_token(&pool.token_y)
 }
@@ -281,98 +286,62 @@ fn canonical_pair_key(a: Pubkey, b: Pubkey) -> (Pubkey, Pubkey) {
     if a < b { (a, b) } else { (b, a) }
 }
 
-// Build the reverse index: every account pubkey that appears in any parsed pool
-// struct maps to that pool's canonical address. When MevEngine::handle_mev_batch
-// processes a committed transaction batch, it can perform an O(1) lookup of each
-// touched vault, tick array, or pool account to find the owning pool and route a
-// MevPoolUpdateEvent to the correct ArbitrageExecutor without iterating all pools.
+// Build the reverse index: every pool's canonical address maps to itself.
+// When MevEngine::handle_mev_batch processes a committed transaction batch, it
+// performs an O(1) lookup of each touched account to find which pool owns it and
+// routes a MevPoolUpdateEvent to the correct ArbitrageExecutor.
+//
+// Only the pool address itself is registered — not vaults, tick arrays, oracles,
+// or any other associated accounts. Registering associated accounts caused 5–10
+// redundant events per swap (one per account touched in the same transaction) and
+// multiplied the simulation fan-out proportionally. The pool state account is the
+// only account that reflects the price change the executor needs to observe; all
+// other accounts are structural and their mutation is implied by the pool update.
 fn build_account_to_pool_map(pool_data: &crate::mev::pools::MintPoolData) -> FxHashMap<Pubkey, Pubkey> {
     let mut map: FxHashMap<Pubkey, Pubkey> = FxHashMap::default();
 
     for pool in &pool_data.raydium_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_vault, pool.pool);
-        map.insert(pool.sol_vault, pool.pool);
     }
     for pool in &pool_data.raydium_cp_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_vault, pool.pool);
-        map.insert(pool.sol_vault, pool.pool);
-        map.insert(pool.observation, pool.pool);
     }
     for pool in &pool_data.raydium_clmm_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.x_vault, pool.pool);
-        map.insert(pool.y_vault, pool.pool);
-        map.insert(pool.bitmap_extension, pool.pool);
-        map.insert(pool.observation_state, pool.pool);
-        for ta in &pool.tick_arrays { map.insert(*ta, pool.pool); }
     }
     for pool in &pool_data.pump_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_vault, pool.pool);
-        map.insert(pool.sol_vault, pool.pool);
     }
     for pool in &pool_data.meteora_damm_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_x_vault, pool.pool);
-        map.insert(pool.token_sol_vault, pool.pool);
     }
     for pool in &pool_data.meteora_damm_v2_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_x_vault, pool.pool);
-        map.insert(pool.token_sol_vault, pool.pool);
     }
     for pool in &pool_data.dlmm_pairs {
         map.insert(pool.pair, pool.pair);
-        map.insert(pool.token_vault, pool.pair);
-        map.insert(pool.sol_vault, pool.pair);
-        map.insert(pool.oracle, pool.pair);
-        for ba in &pool.bin_arrays { map.insert(*ba, pool.pair); }
     }
     for pool in &pool_data.whirlpool_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.x_vault, pool.pool);
-        map.insert(pool.y_vault, pool.pool);
-        map.insert(pool.oracle, pool.pool);
-        for ta in &pool.tick_arrays { map.insert(*ta, pool.pool); }
     }
     for pool in &pool_data.byreal_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.x_vault, pool.pool);
-        map.insert(pool.y_vault, pool.pool);
-        map.insert(pool.bitmap_extension, pool.pool);
-        map.insert(pool.observation_state, pool.pool);
-        for ta in &pool.tick_arrays { map.insert(*ta, pool.pool); }
     }
     for pool in &pool_data.pancakeswap_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.x_vault, pool.pool);
-        map.insert(pool.y_vault, pool.pool);
-        map.insert(pool.bitmap_extension, pool.pool);
-        map.insert(pool.observation_state, pool.pool);
-        for ta in &pool.tick_arrays { map.insert(*ta, pool.pool); }
     }
     for pool in &pool_data.humidifi_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_x_vault, pool.pool);
-        map.insert(pool.token_sol_vault, pool.pool);
     }
     for pool in &pool_data.vertigo_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_x_vault, pool.pool);
-        map.insert(pool.token_sol_vault, pool.pool);
     }
     for pool in &pool_data.heaven_pools {
         map.insert(pool.pool, pool.pool);
-        map.insert(pool.token_x_vault, pool.pool);
-        map.insert(pool.token_base_vault, pool.pool);
     }
     for pool in &pool_data.futarchy_pools {
         // Futarchy identifies its pool by its DAO account, not a pool address.
         map.insert(pool.dao, pool.dao);
-        map.insert(pool.token_x_vault, pool.dao);
-        map.insert(pool.token_sol_vault, pool.dao);
     }
 
     map
