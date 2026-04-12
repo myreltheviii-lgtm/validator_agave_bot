@@ -6292,6 +6292,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtrb"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7204ed6420f698836b76d4d5c2ec5dec7585fd5c3a788fd1cde855d1de598239"
+
+[[package]]
 name = "rts-alloc"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8116,6 +8122,7 @@ dependencies = [
  "rayon",
  "reqwest 0.12.28",
  "rolling-file",
+ "rtrb",
  "rts-alloc",
  "rustc-hash 2.1.1",
  "rustls",

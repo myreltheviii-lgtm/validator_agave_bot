@@ -1,10 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+
 // libc provides the raw sched_setaffinity(2) syscall interface used to bind
-// each Tokio worker thread to a specific logical CPU at thread-start time.
-// The crate is a direct dependency of Agave itself so no Cargo.toml change
-// is required.
+// each shard and HTTP thread to a specific logical CPU. The crate is a direct
+// dependency of Agave itself so no Cargo.toml change is required.
 use libc;
 
 use arc_swap::ArcSwap;
@@ -17,235 +17,180 @@ use solana_runtime::bank_forks::{BankForks, ReadOnlyAtomicSlot};
 use solana_pubkey::Pubkey;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
-use tokio::sync::{broadcast, Semaphore};
 use tracing::{debug, error, info, warn};
-// reqwest::Client is constructed once in MevEngine::new() and cloned (Arc-cheap)
-// into every ArbitrageExecutor. A single shared connection pool means all executors
-// reuse TCP connections to the Helius Sender FRA relay rather than each opening
-// their own — avoiding both the per-constructor allocation and the per-submission
-// handshake cost.
-use reqwest::Client as HttpClient;
 
-use crate::mev::arbitrage::{ArbitrageGraph, ArbitrageGraphConfig, MevPoolUpdateEvent, PoolInfo, PoolType};
+use crate::mev::arbitrage::{PoolInfo, PoolType};
 use crate::mev::constants::SOL_MINT;
-use crate::mev::executor::ArbitrageExecutor;
+use crate::mev::executor::{HttpWorker, HttpWorkItem, MevShard, ShardWorkItem};
 use crate::mev::loaders::pool_discovery::initialize_mint_from_discovered;
 use crate::mev::loaders::pool_graduation::{DetectedPool, GraduationSource};
 use crate::mev::loaders::pool_scanner::DiscoveredPools;
 use crate::mev::lut_manager::LutManager;
 use crate::mev::pools::MintPoolData;
 
-/// Maximum number of simulation tasks that may execute concurrently across ALL
-/// tracked mints.  A single `Arc<Semaphore>` with this many permits is shared
-/// by every `ArbitrageExecutor` in the engine.
-///
-/// SVM simulation is purely CPU-bound — it runs the BPF interpreter, walks
-/// the bank's account cache, and processes compute units with no I/O and no
-/// blocking.  The true parallelism ceiling is therefore the number of physical
-/// cores dedicated to the MEV runtime, which on this machine is 12 (physical
-/// cores 12–23 of the Threadripper PRO 7965WX).  Running more than 12 tasks
-/// simultaneously does not increase throughput; it only increases context-switch
-/// overhead and L1/L2 cache pressure as tasks compete for the same execution
-/// units on the same physical core via SMT.
-///
-/// The permit count of 128 is intentionally larger than 12 to absorb burst
-/// traffic: up to 128 tasks may be queued waiting for a permit, but at most 12
-/// of them run on CPU at any instant.  This queue gives headroom during a sudden
-/// flood of pool-update events (e.g. a large batch touching many tracked mints
-/// simultaneously) without immediately dropping work.  Once the burst drains,
-/// the queue empties and permits return to idle.  Setting the cap much higher
-/// would allow stale tasks to accumulate behind live ones; the root-slot
-/// staleness guard in handle_mev_batch already prevents most stale work from
-/// reaching the semaphore, so 128 is a safe and sufficient ceiling.
-const MAX_CONCURRENT_SIMULATIONS: usize = 128;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-/// Maximum number of DetectedPool entries the engine holds in pending_ready at
-/// any one time.  Pool creation is permissionless — an adversary can spam
-/// creation transactions to grow the map without bound.  The cap bounds the
-/// memory cost at approximately 100 bytes × 4096 entries ≈ 400 KB regardless
-/// of spam volume.  When the cap is reached, new graduation events are dropped
-/// and the pools they describe are missed for this run of the engine.  The dead-
-/// slot sweep removes stale entries promptly so the cap is rarely approached
-/// under normal operating conditions.
+/// Maximum number of DetectedPool entries held in `pending_ready` at any one
+/// time. Pool creation is permissionless — an adversary can spam creation
+/// transactions to grow the map without bound. The cap bounds the memory cost
+/// at approximately 100 bytes × 4096 entries ≈ 400 KB regardless of spam
+/// volume. When the cap is reached, new graduation events are dropped. The
+/// dead-slot sweep removes stale entries promptly so the cap is rarely
+/// approached under normal operating conditions.
 const MAX_PENDING_READY: usize = 4096;
 
+/// Number of shard threads and paired HTTP threads. Each shard owns mints
+/// where `mint_pubkey[0] % NUM_SHARDS == shard_idx` and runs on one of
+/// logical CPUs 12–23 of the Threadripper PRO 7965WX (physical cores 12–23).
+const NUM_SHARDS: usize = 12;
+
+/// First logical CPU in the range reserved for MEV shard and HTTP threads.
+/// The engine and validator occupy physical cores 0–11 (logical CPUs 0–11).
+/// These cores are the second half of the physical die, sharing no L2 with
+/// the validator-side cores regardless of what either side is doing.
+const MEV_CORE_BASE: usize = 12;
+
+/// Capacity of the engine→shard rtrb ring buffer. Sized to absorb burst traffic
+/// (e.g. a large batch touching many mints simultaneously) without dropping
+/// events. Once the burst drains the queue empties and the staleness guard
+/// discards anything that aged during the wait. PoolUpdate items are dropped on
+/// Full — they are always stale by definition. RegisterMint and GraduatePool
+/// items spin-retry until the shard drains.
+const SHARD_RING_CAPACITY: usize = 512;
+
+/// Capacity of the shard→HTTP rtrb ring buffer. Profitable submissions are
+/// far rarer than pool updates — this capacity is deliberately small so a
+/// stalled HTTP thread is detected quickly (buffer full → warn and drop).
+const HTTP_RING_CAPACITY: usize = 32;
+
+// ---------------------------------------------------------------------------
+// MintState
+// ---------------------------------------------------------------------------
+
+/// Per-mint state stored on the engine.
+///
+/// In the sharded design the engine no longer owns `ArbitrageGraph` objects
+/// or broadcast channels. Graphs live on shard threads. The engine retains
+/// only what it needs for its own responsibilities:
+///
+///   • `pool_data` — for graduation merging (rare write, then forwarded to shard).
+///   • `tracked_accounts` — for de-registering accounts from `account_to_mint`
+///     if a mint is ever removed (future capability, already modelled here).
 struct MintState {
-    /// Shared, atomically swappable pointer to the current pool data for this mint.
+    /// Atomically swappable pointer to the current pool data.
     ///
-    /// `ArcSwap<MintPoolData>` provides lock-free reads via epoch-based RCU. The
-    /// executor calls `load()` on the hot path — one atomic pointer read with no
-    /// mutex, no compare-and-swap under contention, and no blocking. The engine
-    /// calls `store()` only during graduation events (rare), atomically replacing
-    /// the Arc. Readers holding a Guard from the previous generation see consistent
-    /// data until they drop the Guard; the old Arc is freed only after all such
-    /// Guards are released.
+    /// The engine reads this on the known-mint graduation path to merge the
+    /// new pool's vault addresses into the existing set, then stores the updated
+    /// Arc so future graduation calls see the current state. The associated
+    /// `MevShard` receives the updated Arc via a `GraduatePool` work item and
+    /// replaces its local `mint_to_pool_data` entry — maintaining consistency
+    /// without any cross-thread lock.
     pool_data: Arc<ArcSwap<MintPoolData>>,
-    /// The arb graph is behind a `RwLock` so the engine can insert newly
-    /// graduated pools into it without stopping or restarting the associated
-    /// `ArbitrageExecutor`.  The executor acquires the read lock exactly once
-    /// per event in a single window covering: address → pair-index lookup,
-    /// pair → path clone, and structural pre-filter.  The lock is released
-    /// before any `tokio::spawn` or `await` point, ensuring that a graduation
-    /// write never waits for a mid-await simulation task.
-    arb_graph: Arc<RwLock<ArbitrageGraph>>,
-    /// Broadcast sender for this mint's pool-update events.  Capacity is 1024
-    /// events.  The broadcast semantics evict the oldest event when a receiver
-    /// falls behind — the engine's select loop is never blocked by a slow executor.
-    pool_update_tx: broadcast::Sender<MevPoolUpdateEvent>,
-    /// Every on-chain account pubkey this mint's pools require, stored here so
-    /// they can be removed from `account_to_mint` in bulk if the mint is
-    /// ever de-registered.  Updated on graduation to include newly discovered
-    /// vault accounts.
+
+    /// Every on-chain account pubkey this mint's pools require.
+    ///
+    /// Updated on graduation to include newly discovered vault accounts.
+    /// Used to populate and later clean up `account_to_mint` entries.
     tracked_accounts: Vec<Pubkey>,
 }
 
+// ---------------------------------------------------------------------------
+// MevEngine
+// ---------------------------------------------------------------------------
+
 pub struct MevEngine {
     /// Receives `MevExecutedBatch` values from `execute_batch()` in
-    /// `blockstore_processor.rs`.  Every time a transaction batch commits to the
-    /// canonical replay bank mid-slot, one payload arrives here carrying the
-    /// committed bank, the sanitized transactions, and their commit results.
-    /// This is the earliest possible signal: the hook fires before
-    /// `bank.freeze()`, before `TransactionStatusService`, and before any Geyser
-    /// plugin notification.
+    /// `blockstore_processor.rs`. Every time a transaction batch commits to the
+    /// canonical replay bank mid-slot, one payload arrives here.
     mev_batch_rx: Receiver<MevExecutedBatch>,
-    /// Receives frozen canonical banks directly from `ReplayStage` the moment
-    /// `bank.freeze()` completes.  Used to drive pool-graduation Phase 2 when a
-    /// new pool's creation transaction lands just before slot completion.
+
+    /// Receives frozen canonical banks from `ReplayStage` the moment
+    /// `bank.freeze()` completes. Used as a fallback for graduation Phase 2.
     bank_rx: Receiver<Arc<Bank>>,
+
     /// Receives dead-slot numbers from `ReplayStage::mark_dead_slot`.
-    ///
-    /// A slot is declared dead when the canonical replay pipeline rejects it due
-    /// to invalid PoH, failed signature batch verification, SVM execution error,
-    /// or chained block-ID mismatch.  On receipt the engine sweeps `pending_ready`
-    /// entries for that slot and forwards the slot to the graduation detector in
-    /// the bridge so it can clear its per-DEX pending maps.
     dead_slot_rx: Receiver<Slot>,
-    /// Receives `DetectedPool` values from the shredstream bridge whenever it
-    /// observes a pool-creation instruction in the raw entry stream.
-    ///
-    /// The bridge performs Phase 1 of the two-phase graduation pipeline: scanning
-    /// raw instruction bytes for DEX-specific pool-creation discriminators before
-    /// any bank execution has occurred.  The engine performs Phase 2: when a
-    /// `MevExecutedBatch` arrives whose committed transactions include the detected
-    /// pool address, the creation is confirmed and the pool is integrated into the
-    /// arb graph using the bank that just committed those transactions.
-    graduation_rx: Receiver<DetectedPool>,
-    /// Sender half of the graduation channel, stored here so it can be moved into
-    /// the bridge spawn inside `run_async`.  Wrapped in `Option` so `take()` can
-    /// transfer ownership exactly once without cloning.
+
+    /// Receives `DetectedPool` values from the shredstream bridge (Phase 1
+    /// of the two-phase graduation pipeline).
+    graduation_rx: crossbeam_channel::Receiver<DetectedPool>,
+
+    /// Sender half of the graduation channel, moved into the bridge thread
+    /// inside `run()`. Wrapped in `Option` so `take()` transfers ownership
+    /// exactly once.
     graduation_tx: Option<crossbeam_channel::Sender<DetectedPool>>,
-    /// Sender half of the engine→bridge dead-slot forwarding channel.
+
+    /// Dedicated dead-slot forwarding channel to the bridge.
     ///
-    /// When the engine receives a dead slot from `dead_slot_rx` it immediately
-    /// echoes it through this channel.  The bridge calls
-    /// `detector.clear_dead_slot(slot)` to sweep its per-DEX pending maps,
-    /// preventing stale entries from accumulating and crowding out genuine
-    /// new-pool detections.  Using a dedicated forwarding channel (rather than
-    /// cloning the receiver) guarantees both endpoints see every event because
+    /// The engine echoes every dead slot it receives from `dead_slot_rx`
+    /// through this channel. Using a dedicated forwarding channel (rather than
+    /// cloning the receiver) guarantees the bridge sees every event because
     /// cloning a crossbeam Receiver creates an independent consumer that splits
     /// messages non-deterministically.
     bridge_dead_slot_tx: crossbeam_channel::Sender<Slot>,
-    /// Receiver half moved into the bridge spawn in `run_async` exactly once.
-    /// Wrapped in `Option` so `take()` transfers ownership without cloning.
+
+    /// Receiver half moved into the bridge thread in `run()` exactly once.
     bridge_dead_slot_rx: Option<crossbeam_channel::Receiver<Slot>>,
+
     bank_forks: Arc<RwLock<BankForks>>,
     wallet: Arc<Keypair>,
     lut_manager: Arc<LutManager>,
     rpc_client: Arc<RpcClient>,
     base_priority_fee: u64,
     min_profit_lamports: u64,
-    /// When true, the executor runs the full simulation pipeline but does not
-    /// submit any transactions.  Used to verify that the arb graph, instruction
-    /// builder, and simulation path produce valid results before deploying live
-    /// capital.
+
+    /// When true, the shard runs the full simulation pipeline but does not
+    /// submit any transactions.
     validation_mode: bool,
-    shredstream_url: String,
-    /// Operator-configured floor for the Jito tip transfer in every submission
-    /// transaction.  Passed to every `ArbitrageExecutor` at construction time.
-    ///
-    /// The actual tip paid per transaction is `max(gross_profit × TIP_FRACTION,
-    /// jito_tip_lamports)` — proportional to the simulated gross profit so that
-    /// larger opportunities bid more aggressively in the Jito block-engine
-    /// auction, with this value as the absolute minimum to maintain dual-routing
-    /// eligibility through Helius Sender.  Must be at least
-    /// `HELIUS_SENDER_MIN_TIP_LAMPORTS` (200_000 lamports / 0.0002 SOL) or the
-    /// executor will return an error at construction time.
+
     jito_tip_lamports: u64,
-    /// Shared async HTTP client passed to every `ArbitrageExecutor` at construction.
-    ///
-    /// `reqwest::Client` is an `Arc`-wrapped connection pool — `clone()` is a single
-    /// atomic increment with no heap allocation.  Constructing it once here and
-    /// cloning into each executor means all executors share the same underlying pool
-    /// and reuse established TCP connections to the Helius Sender FRA relay rather
-    /// than each opening separate connections.  The previous approach of calling
-    /// `HttpClient::new()` inside `ArbitrageExecutor::new()` allocated a full
-    /// connection pool per executor — with ~2.1 M mints registered at startup that
-    /// produced millions of pool-object allocations sequentially, causing the
-    /// observed 8-minute startup delay.
-    http_client: HttpClient,
+    shredstream_url: String,
+
     /// Lock-free read of the BankForks confirmed root slot.
     ///
-    /// `ReadOnlyAtomicSlot` wraps the same `Arc<AtomicU64>` that `BankForks`
-    /// advances every time `ReplayStage` calls `set_root()`.  Reading it costs
-    /// exactly one `Ordering::Acquire` atomic load — no `RwLock`, no syscall,
-    /// no cache-line contention — making it safe and cheap to call on every
-    /// incoming batch in `handle_mev_batch`.
-    ///
+    /// One `Ordering::Acquire` atomic load per batch — no RwLock, no syscall.
     /// Under Solana's supermajority confirmation rule the root always trails
-    /// the active working bank by roughly 32 slots.  The gap between the root
-    /// and a batch's slot therefore acts as a precise, zero-cost staleness
-    /// signal: a small gap (≤ ~32 slots) means the batch is live; a large gap
-    /// (thousands of slots) means the validator is still replaying historical
-    /// blocks during catchup and the batch carries prices the market has
-    /// already moved past.
+    /// the active working bank by roughly 32 slots. A gap > 150 means the
+    /// validator is replaying historical blocks (catchup) and pool prices are
+    /// stale by thousands of slots.
     root_slot: ReadOnlyAtomicSlot,
-    simulation_semaphore: Arc<Semaphore>,
-    /// Keyed on mint pubkey.  FxHashMap is used throughout because all keys are
-    /// 32-byte Pubkeys, for which SipHash's collision resistance adds no security
-    /// value while costing 4–6× the CPU time of FxHash's identity-style mixing.
+
+    /// Keyed on mint pubkey. FxHashMap for O(1) FxHash lookups on 32-byte keys.
     mint_states: FxHashMap<Pubkey, MintState>,
-    /// Reverse index: account pubkey → mint.  Routes each incoming pool-account
-    /// address from a `MevExecutedBatch` to the correct per-mint broadcast channel
-    /// in O(1) time without iterating over all registered mints.
+
+    /// Reverse index: account pubkey → mint pubkey.
     ///
-    /// FxHashMap is used because this map is queried for every account key in every
-    /// committed transaction on every batch — the hottest lookup in the engine.
-    /// SipHash's 4–6× overhead over FxHash for 32-byte keys is a measurable penalty
-    /// on this path; FxHash's non-cryptographic mixing is safe because Pubkeys are
-    /// not attacker-controlled hash inputs inside a network service.
+    /// Routes each incoming pool-account address from a `MevExecutedBatch` to
+    /// the correct shard in O(1) time. This is the hottest lookup in the engine —
+    /// called for every account key in every committed transaction on every batch.
     account_to_mint: FxHashMap<Pubkey, Pubkey>,
-    /// Executor fan-out tasks queued up during `new()` and `register_mint()`.
-    /// They cannot be spawned at construction time because `MevEngine::new` is
-    /// called from the synchronous `Validator::new` context where no Tokio runtime
-    /// is active — calling `tokio::spawn` outside a runtime panics.  The pairs are
-    /// drained inside `run_async` after the MEV runtime has been created.
-    pending_executor_starts: Vec<(Arc<ArbitrageExecutor>, broadcast::Receiver<MevPoolUpdateEvent>)>,
+
     /// Zero-allocation per-batch account list shared with the shredstream bridge.
     ///
-    /// The bridge calls `ArcSwap::load()` on every entry batch — one atomic pointer
-    /// read returning a `Guard<Arc<Vec<Pubkey>>>`, with no heap allocation and no
-    /// lock.  The engine writes a new Vec only at graduation events (rare): it builds
-    /// the Vec off the hot path and calls `store(Arc::new(new_vec))`, which atomically
-    /// replaces the pointer.  Guards held by in-flight bridge iterations see a
-    /// consistent snapshot until they drop, at which point the old Arc is freed.
+    /// The bridge calls `ArcSwap::load()` on every entry batch — one atomic
+    /// pointer read, no heap allocation, no lock. The engine writes a new Vec
+    /// only at graduation events (rare).
     cached_accounts_to_watch: Arc<ArcSwap<Vec<Pubkey>>>,
-    /// Pool addresses detected by the bridge's graduation detector (Phase 1) that
-    /// are waiting for their creation transaction to be confirmed by a committed
-    /// `MevExecutedBatch` (Phase 2).
-    ///
-    /// When the bridge sees a pool-creation instruction, it sends a `DetectedPool`
-    /// here before the shredstream entry is processed further.  The engine stores it
-    /// in this map.  When a `MevExecutedBatch` arrives that includes the pool address
-    /// among the committed accounts, Phase 2 fires: the pool is parsed from the bank
-    /// and integrated into the appropriate arb graph.
-    ///
-    /// Entries for failed or dead-slot transactions are swept on receipt of the
-    /// corresponding `dead_slot_rx` message.  Bounded by `MAX_PENDING_READY` to
-    /// prevent adversarial pool-creation spam from growing the map unboundedly.
-    ///
-    /// FxHashMap is used for consistency with `account_to_mint` and `mint_states`;
-    /// the map is probed on every committed account key lookup.
+
+    /// Pool addresses detected by the bridge (Phase 1) waiting for their
+    /// creation transaction to be confirmed by a `MevExecutedBatch` (Phase 2).
+    /// Bounded by `MAX_PENDING_READY` to prevent adversarial spam.
     pending_ready: FxHashMap<Pubkey, DetectedPool>,
+
+    /// Per-batch deduplication set cleared at the start of every
+    /// `handle_mev_batch` call. Stored here so `clear()` reuses the backing
+    /// allocation with no heap activity on the hot path.
+    seen_this_batch: FxHashSet<Pubkey>,
+
+    /// One rtrb `Producer` per shard. The engine pushes `ShardWorkItem` values
+    /// here instead of broadcasting to 2.7M Tokio tasks. Initialised as an empty
+    /// Vec in `new()`; populated before the select loop starts in `run()`.
+    ///
+    /// Index 0 → shard 0 (mints with byte[0] % 12 == 0)
+    /// Index 11 → shard 11
+    shard_producers: Vec<rtrb::Producer<ShardWorkItem>>,
 }
 
 impl MevEngine {
@@ -265,34 +210,21 @@ impl MevEngine {
         shredstream_url: String,
         mint_pool_data: Vec<Arc<MintPoolData>>,
     ) -> Self {
-        let simulation_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SIMULATIONS));
-
-        // Both halves of the graduation channel are stored on the engine. In
-        // run_async, graduation_tx is taken out (via Option::take) and moved into
-        // the bridge spawn. graduation_rx stays on the engine and participates in
-        // the select! loop. The channel is unbounded so Phase 1 detections never
-        // block the bridge regardless of how fast the engine processes them.
         let (graduation_tx, graduation_rx) =
             crossbeam_channel::unbounded::<DetectedPool>();
 
-        // The bridge needs to know about dead slots so it can clear stale entries
-        // from its per-DEX pending maps. Rather than cloning the engine's dead_slot_rx
-        // (which creates an independent consumer and splits messages between the two
-        // endpoints), the engine forwards each received dead slot through this
-        // dedicated channel. The bridge receives a complete copy of every event.
+        // Dedicated dead-slot forwarding channel. The bridge needs to know about
+        // dead slots to clear its per-DEX pending maps. Forwarding through a
+        // separate channel (rather than cloning the receiver) ensures both
+        // endpoints see every event.
         let (bridge_dead_slot_tx, bridge_dead_slot_rx) =
             crossbeam_channel::unbounded::<Slot>();
 
-        // Obtain a lock-free handle to the confirmed root slot before the engine
-        // struct is constructed.  `get_atomic_root()` clones the `Arc<AtomicU64>`
-        // that BankForks already owns internally, so both the engine and BankForks
-        // point at the same atomic.  Every subsequent `ReplayStage::set_root()`
-        // call advances this value automatically — no further interaction with
-        // BankForks is needed to keep it current.  The read lock is held only
-        // for this single call; it is released before any registration work begins.
+        // Single atomic load to obtain the current root slot handle.
+        // Held only for this call; released before any registration work begins.
         let root_slot = bank_forks
             .read()
-            .expect("BankForks RwLock is poisoned at MEV engine construction")
+            .expect("BankForks RwLock poisoned at engine construction")
             .get_atomic_root();
 
         let mut engine = Self {
@@ -313,140 +245,99 @@ impl MevEngine {
             validation_mode,
             shredstream_url,
             root_slot,
-            simulation_semaphore,
-            // Single connection pool shared across all executors. Clone into each
-            // ArbitrageExecutor is one atomic increment — no heap allocation. The pool
-            // is lazy: no TCP connection is opened until the first send_transaction call.
-            http_client: HttpClient::new(),
             mint_states: FxHashMap::default(),
             account_to_mint: FxHashMap::default(),
-            pending_executor_starts: Vec::new(),
-            // Initialised as an empty Vec. The shredstream bridge does not start
-            // until run_async, so nothing reads this field while the registration
-            // loop below executes. All tracked accounts are written into this
-            // ArcSwap in a single O(n) pass after every mint has been registered
-            // via register_mint_startup — see the comment after the loop.
+            // Initialised as empty Vec — bridge does not start until `run()`,
+            // so nothing reads this while the registration loop executes.
             cached_accounts_to_watch: Arc::new(ArcSwap::from(Arc::new(Vec::new()))),
             pending_ready: FxHashMap::default(),
+            seen_this_batch: FxHashSet::default(),
+            // Populated in run() before the select loop starts.
+            shard_producers: Vec::new(),
         };
 
         for pool_data in mint_pool_data {
             engine.register_mint_startup(pool_data);
         }
 
-        // account_to_mint is now fully populated — every tracked account across
-        // every registered mint maps to exactly one mint pubkey, making it the
-        // correct, deduplicated source of truth for the complete account watch list.
-        // A single O(n) pass over its keys builds the Vec the shredstream bridge
-        // reads on every entry batch to decide which account writes to forward.
-        // Building the Vec once here — after all registrations are complete —
-        // avoids the O(n²) cost of cloning and rebuilding the growing Vec inside
-        // each register_mint_startup call.
+        // account_to_mint is now fully populated. Build the deduplicated account
+        // watch list that the shredstream bridge will use. A single O(n) pass
+        // here — after all registrations — avoids the O(n²) cost of rebuilding
+        // the growing Vec inside each register_mint_startup call.
         let all_accounts: Vec<Pubkey> = engine.account_to_mint.keys().copied().collect();
         engine.cached_accounts_to_watch.store(Arc::new(all_accounts));
 
         engine
     }
 
-    /// Register a mint and queue its `ArbitrageExecutor` fan-out task for launch
-    /// when the MEV Tokio runtime becomes active inside `run_async`.
+    // -----------------------------------------------------------------------
+    // Mint registration
+    // -----------------------------------------------------------------------
+
+    /// Startup-only variant of [`register_mint`] used exclusively during
+    /// [`MevEngine::new`] when initialising the engine with pre-loaded pool data.
     ///
-    /// Idempotent: if the mint is already registered the function returns
-    /// immediately without rebuilding the arb graph or creating a second executor.
+    /// Does NOT build an `ArbitrageGraph` — that work is deferred to the shard
+    /// threads in `run()`. Building graphs here AND in the shard would double the
+    /// startup cost. Instead this method uses a lightweight account extractor that
+    /// reads only the account addresses from pool_data without doing pair analysis.
     ///
-    /// Every tracked account pubkey for the newly registered mint is inserted into
-    /// `cached_accounts_to_watch` under a brief write lock.  Because the set
-    /// deduplicates automatically, accounts shared with already-registered mints
-    /// are silently skipped — the set stays minimal.  The shredstream bridge holds
-    /// an `Arc` clone and snapshots the set once per entry batch — new accounts are
-    /// therefore covered by speculative execution within one slot of this call.
+    /// Does NOT update `cached_accounts_to_watch` per-call — a single O(n) pass
+    /// after all registrations is done in `new()`.
+    fn register_mint_startup(&mut self, pool_data: Arc<MintPoolData>) {
+        let mint = pool_data.mint;
+        if self.mint_states.contains_key(&mint) {
+            return;
+        }
+
+        // Extract tracked accounts without building the full ArbitrageGraph.
+        // The graph is built by the owning MevShard in run() — building it here
+        // just to get the account list would pay O(pairs) work for nothing.
+        let tracked_accounts = extract_tracked_accounts(&pool_data);
+
+        for account in &tracked_accounts {
+            self.account_to_mint.insert(*account, mint);
+        }
+
+        let tracked_count = tracked_accounts.len();
+        let pool_data_swap = Arc::new(ArcSwap::from(pool_data));
+
+        self.mint_states.insert(mint, MintState {
+            pool_data: pool_data_swap,
+            tracked_accounts,
+        });
+
+        debug!(
+            "MevEngine: registered mint {} ({} tracked accounts)",
+            mint, tracked_count
+        );
+    }
+
+    /// Runtime variant of mint registration called during unknown-mint graduation.
+    ///
+    /// Idempotent: returns immediately if the mint is already registered.
+    /// Updates `cached_accounts_to_watch` immediately since the shredstream bridge
+    /// is already running and needs to start watching the new accounts within the
+    /// current slot.
     pub fn register_mint(&mut self, pool_data: Arc<MintPoolData>) {
         let mint = pool_data.mint;
         if self.mint_states.contains_key(&mint) {
             return;
         }
 
-        let config = ArbitrageGraphConfig::default();
-        // The arb graph is wrapped in RwLock so new pools detected by the
-        // graduation pipeline can be inserted at runtime without rebuilding the
-        // graph or restarting the executor. The executor acquires the read lock
-        // briefly on each event; the engine acquires the write lock only when a
-        // new pool graduates — a rare event that does not contend with the hot path.
-        let arb_graph = Arc::new(RwLock::new(
-            ArbitrageGraph::build_with_config(&pool_data, config)
-        ));
-
-        let tracked_accounts = {
-            // Recover from a poisoned lock: if a previous holder panicked while
-            // the write lock was held, the guard is still valid and the data is
-            // still usable — the panic already unwound that writer's stack.
-            let g = arb_graph.read().unwrap_or_else(|p| p.into_inner());
-            g.all_tracked_accounts()
-        };
-        // when a graduation event brings a new pool for this mint. Both MintState
-        // and ArbitrageExecutor hold Arc<ArcSwap<...>> clones pointing to the same
-        // ArcSwap. The engine calls store() on graduation (rare write); the executor
-        // calls load() on every simulation (frequent lock-free read).
-        let pool_data_swap = Arc::new(ArcSwap::from(pool_data));
-
-        // Each registered mint owns a dedicated broadcast channel. Capacity 1024
-        // matches the startup path: the oldest event is silently evicted when a
-        // lagging receiver falls behind rather than blocking the engine. The sender
-        // half is stored in MintState; the receiver half is handed to the executor
-        // so it can be driven by the pending_executor_starts mechanism in run_async.
-        let (pool_update_tx, pool_update_rx) = broadcast::channel(1024);
-
-        let executor = Arc::new(
-            match ArbitrageExecutor::new(
-                Arc::clone(&arb_graph),
-                Arc::clone(&pool_data_swap),
-                Arc::clone(&self.wallet),
-                Arc::clone(&self.lut_manager),
-                Arc::clone(&self.rpc_client),
-                self.base_priority_fee,
-                self.min_profit_lamports,
-                // Clone is a single Arc refcount increment — no allocation.
-                self.http_client.clone(),
-                self.jito_tip_lamports,
-                self.validation_mode,
-            ) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        "MevEngine: ArbitrageExecutor construction failed for mint {} \
-                         (tip config invalid) — mint skipped: {}",
-                        mint, e
-                    );
-                    return;
-                }
-            }
-        );
-
-        self.pending_executor_starts.push((executor, pool_update_rx));
+        let tracked_accounts = extract_tracked_accounts(&pool_data);
 
         for account in &tracked_accounts {
             self.account_to_mint.insert(*account, mint);
         }
 
-        // Build a new Vec that merges all previously tracked accounts with the
-        // newly registered ones.  account_to_mint is already the authoritative
-        // deduplication source: any account already present in the map is owned by
-        // a previously registered mint and must not appear twice in the Vec.
-        // The existing Vec is loaded atomically, extended with only genuinely new
-        // accounts, and then atomically stored back.  This is done off the critical
-        // path (register_mint runs at startup, not per slot) so the Vec rebuild cost
-        // is irrelevant to steady-state latency.
-        //
-        // A HashSet is built from the existing Vec to provide O(1) membership
-        // testing — Vec::contains is O(n) and becomes O(n²) when called for
-        // each account over a large existing list.
+        // Update the watch list atomically so the bridge picks up the new
+        // accounts. Only genuinely new accounts are added — the FxHashSet
+        // deduplication check avoids growing the Vec with duplicates that are
+        // already tracked under another mint.
         {
             let current = self.cached_accounts_to_watch.load();
             let mut new_vec: Vec<Pubkey> = (**current).clone();
-            // FxHashSet provides O(1) membership tests for the deduplication scan.
-            // The set is built from the existing Vec once per register_mint call —
-            // this is off the hot path (startup / rare graduation) so the
-            // allocation is not a concern.
             let existing: FxHashSet<Pubkey> = new_vec.iter().copied().collect();
             for account in &tracked_accounts {
                 if !existing.contains(account) {
@@ -457,293 +348,232 @@ impl MevEngine {
         }
 
         let tracked_count = tracked_accounts.len();
+        let pool_data_swap = Arc::new(ArcSwap::from(pool_data.clone()));
 
-        self.mint_states.insert(
-            mint,
-            MintState {
-                pool_data: pool_data_swap,
-                arb_graph,
-                pool_update_tx,
-                tracked_accounts,
-            },
+        self.mint_states.insert(mint, MintState {
+            pool_data: pool_data_swap,
+            tracked_accounts,
+        });
+
+        // Send a RegisterMint work item to the correct shard. The shard builds
+        // the full ArbitrageGraph and adds all accounts to its own local map.
+        // RegisterMint must not be dropped — spin-retry until the shard drains.
+        let shard_idx = shard_for_mint(&mint);
+        self.push_critical_item(
+            shard_idx,
+            ShardWorkItem::RegisterMint { pool_data },
         );
 
         info!(
-            "MevEngine: registered mint {} ({} tracked accounts)",
-            mint, tracked_count
+            "MevEngine: registered new mint {} ({} tracked accounts) → shard {}",
+            mint, tracked_count, shard_idx
         );
     }
 
-    /// Startup-only variant of [`register_mint`] used exclusively during [`MevEngine::new`]
-    /// when initialising the engine with the full batch of pre-loaded pool data.
-    ///
-    /// The shredstream bridge does not start until [`run_async`] is called. Because
-    /// nothing reads `cached_accounts_to_watch` while this method executes, updating
-    /// it on every call would be pure waste. This method omits that update entirely.
-    /// After the registration loop in [`new`] completes, a single O(n) pass over
-    /// `account_to_mint` builds the full deduplicated account Vec and stores it
-    /// atomically into `cached_accounts_to_watch` — one allocation for all mints
-    /// combined, rather than one allocation per mint.
-    fn register_mint_startup(&mut self, pool_data: Arc<MintPoolData>) {
-        let mint = pool_data.mint;
-        if self.mint_states.contains_key(&mint) {
-            return;
-        }
-
-        let config = ArbitrageGraphConfig::default();
-        let arb_graph = Arc::new(RwLock::new(
-            ArbitrageGraph::build_with_config(&pool_data, config)
-        ));
-
-        let tracked_accounts = {
-            // Recover from a poisoned lock — see register_mint for the rationale.
-            let g = arb_graph.read().unwrap_or_else(|p| p.into_inner());
-            g.all_tracked_accounts()
-        };
-
-        let (pool_update_tx, pool_update_rx) = broadcast::channel(1024);
-
-        let pool_data_swap = Arc::new(ArcSwap::from(pool_data));
-
-        let executor = Arc::new(
-            // At startup jito_tip_lamports has already been validated by the operator
-            // before the engine is constructed — an Err here indicates a programming
-            // error in the caller's config assembly, so expect() is appropriate for
-            // fail-fast detection before live blocks arrive.
-            ArbitrageExecutor::new(
-                Arc::clone(&arb_graph),
-                Arc::clone(&pool_data_swap),
-                Arc::clone(&self.wallet),
-                Arc::clone(&self.lut_manager),
-                Arc::clone(&self.rpc_client),
-                self.base_priority_fee,
-                self.min_profit_lamports,
-                // Clone is a single Arc refcount increment — no allocation.
-                self.http_client.clone(),
-                self.jito_tip_lamports,
-                self.validation_mode,
-            )
-            .expect("ArbitrageExecutor construction failed at startup — check jito_tip_lamports config")
-        );
-
-        self.pending_executor_starts.push((executor, pool_update_rx));
-
-        // account_to_mint is the reverse index the engine queries on every
-        // MevExecutedBatch to route pool-account writes to the correct executor.
-        // Populating it here is the only mutation that matters during startup —
-        // it is the source of truth from which cached_accounts_to_watch is built
-        // once in MevEngine::new after all mints are registered.
-        for account in &tracked_accounts {
-            self.account_to_mint.insert(*account, mint);
-        }
-
-        let tracked_count = tracked_accounts.len();
-
-        self.mint_states.insert(
-            mint,
-            MintState {
-                pool_data: pool_data_swap,
-                arb_graph,
-                pool_update_tx,
-                tracked_accounts,
-            },
-        );
-
-        // debug! not info! — called once per registered mint at startup.
-        // With millions of mints this would produce millions of info-level log
-        // lines and millions of format-string allocations, measurably slowing
-        // startup.  debug! is filtered at the subscriber level when debug logging
-        // is not enabled, costing only a single branch check per call.
-        debug!(
-            "MevEngine: registered mint {} ({} tracked accounts)",
-            mint, tracked_count
-        );
-    }
+    // -----------------------------------------------------------------------
+    // Engine entry point
+    // -----------------------------------------------------------------------
 
     /// Entry point called on the dedicated `"solMevEngine"` OS thread.
     ///
-    /// Creates a private Tokio runtime with 12 worker threads dedicated
-    /// exclusively to MEV simulation work.  This runtime is completely separate
-    /// from the validator's main Tokio runtime, which means a fully saturated
-    /// simulation queue cannot steal scheduler time from consensus, replay,
-    /// banking, or sigverify tasks running on the validator's runtime.
+    /// ## Thread architecture
     ///
-    /// # Physical core isolation
+    /// ```text
+    ///   OS thread "solMevEngine"   — crossbeam select! loop (this function)
+    ///   OS thread "solMevShard00"  — MevShard spin loop, core 12
+    ///   OS thread "solMevShard01"  — MevShard spin loop, core 13
+    ///   …
+    ///   OS thread "solMevShard11"  — MevShard spin loop, core 23
+    ///   OS thread "solMevHttp00"   — HttpWorker spin loop, core 12 (same physical)
+    ///   …
+    ///   OS thread "solMevHttp11"   — HttpWorker spin loop, core 23
+    ///   OS thread "solMevBridge"   — async gRPC bridge with its own mini runtime
+    /// ```
     ///
-    /// The Threadripper PRO 7965WX has 24 physical cores with SMT (2 logical
-    /// threads per physical core), presenting 48 logical CPUs to the OS.
-    /// Linux numbers them such that physical core N owns logical CPUs N and N+24.
+    /// The engine thread itself runs no Tokio runtime. The select! loop is
+    /// synchronous crossbeam — it blocks on the next available message and returns
+    /// to pure Rust code. The bridge thread has its own `current_thread` runtime
+    /// for its gRPC async code; that runtime is fully isolated from both the
+    /// engine thread and the shard threads.
     ///
-    /// This runtime pins each of its 12 worker threads to one unique logical CPU
-    /// in the range 12–23 via `sched_setaffinity(2)`, which correspond to
-    /// physical cores 12–23.  The validator and its Rayon thread pool are
-    /// configured separately to run on physical cores 0–11 (logical CPUs 0–11
-    /// and 24–35).  The two halves of the machine therefore never share a
-    /// physical core, which means they never fight over L1/L2 cache or execution
-    /// units regardless of what either side is doing at any given instant.
+    /// ## Shard initialisation
     ///
-    /// We deliberately use only one logical CPU per physical core (12–23, not
-    /// also 36–47) for the MEV workers.  SVM simulation is a BPF interpreter
-    /// loop that is branch-heavy and makes dense reads from the bank's account
-    /// cache.  Two SMT siblings on the same physical core share the entire L1
-    /// and L2 cache: running two simulations on siblings causes them to
-    /// continuously evict each other's working set, halving effective cache
-    /// capacity per task.  One simulation per physical core keeps the full
-    /// 512 KiB L2 available to that task.
-    ///
-    /// # Why 12 threads
-    ///
-    /// Twelve threads means at most 12 simulations execute on CPU simultaneously,
-    /// one per dedicated physical core, with no SMT dilution and no cache
-    /// competition between MEV workers.  Adding more threads beyond 12 would not
-    /// increase throughput because all 12 physical cores would already be
-    /// saturated; it would only add context-switch overhead.
-    pub fn run(self) {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            // One Tokio worker thread per physical core in the MEV partition.
-            // Physical cores 12–23 of the Threadripper PRO 7965WX are reserved
-            // exclusively for MEV simulation; the validator occupies cores 0–11.
-            .worker_threads(12)
-            .thread_name_fn(|| {
-                // Each worker thread gets a unique sequential name visible in
-                // htop, perf, and system logs so MEV simulation threads can be
-                // identified and monitored independently of validator threads.
-                static ID: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                format!(
-                    "solMevArb{:02}",
-                    ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                )
-            })
-            .on_thread_start(|| {
-                // `on_thread_start` is invoked exactly once by each Tokio worker
-                // thread immediately after the OS creates it, before the thread
-                // enters the Tokio work-stealing loop.  This is the correct and
-                // only reliable hook for setting per-thread CPU affinity inside
-                // a Tokio multi-thread runtime.
-                //
-                // We assign each worker to a unique slot in the logical CPU range
-                // [12, 23].  The counter is module-global and atomic so concurrent
-                // thread starts (which Tokio may do in parallel) cannot race on
-                // the assignment.  With 12 worker threads and 12 available slots
-                // the mapping is always bijective: every worker gets exactly one
-                // core and every reserved core gets exactly one worker.
-                static NEXT_SLOT: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
+    /// Before the select loop starts, all 2.7M mint pool data objects are
+    /// partitioned across 12 shard-init Vecs (`startup_mints[shard_idx]`).
+    /// Each `MevShard::new()` receives its Vec and builds its own
+    /// `ArbitrageGraph` objects entirely on the spawning thread before the shard
+    /// OS thread is created. Once `std::thread::spawn` returns, the shard thread
+    /// owns its graphs and the engine thread never touches them again.
+    pub fn run(mut self) {
+        // Step 1: build ring buffers.
+        //
+        // 12 engine→shard buffers (capacity 512) and 12 shard→HTTP buffers
+        // (capacity 32). Both ends of each buffer are moved to their respective
+        // threads below. After this point the engine holds only the 12 producers
+        // for the engine→shard direction.
+        let mut shard_producers: Vec<rtrb::Producer<ShardWorkItem>> =
+            Vec::with_capacity(NUM_SHARDS);
+        let mut shard_consumers: Vec<rtrb::Consumer<ShardWorkItem>> =
+            Vec::with_capacity(NUM_SHARDS);
+        let mut http_producers: Vec<rtrb::Producer<HttpWorkItem>> =
+            Vec::with_capacity(NUM_SHARDS);
+        let mut http_consumers: Vec<rtrb::Consumer<HttpWorkItem>> =
+            Vec::with_capacity(NUM_SHARDS);
 
-                // Claim one slot in [0, 11] and map it to the corresponding
-                // logical CPU in [12, 23].  The modulo guards against the
-                // theoretical edge case where the counter wraps or Tokio spawns
-                // an unexpected extra thread — in that case the thread lands on
-                // an already-used core rather than escaping the reserved range.
-                let slot       = NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let logical_cpu = 12 + (slot % 12);
+        for _ in 0..NUM_SHARDS {
+            let (ep, ec) = rtrb::RingBuffer::new(SHARD_RING_CAPACITY);
+            let (hp, hc) = rtrb::RingBuffer::new(HTTP_RING_CAPACITY);
+            shard_producers.push(ep);
+            shard_consumers.push(ec);
+            http_producers.push(hp);
+            http_consumers.push(hc);
+        }
 
-                // sched_setaffinity(2) tells the kernel's CFS scheduler that this
-                // thread is permitted to run only on the listed CPU.  Once set,
-                // the scheduler will never migrate the thread to a different core,
-                // which preserves the hot working set in L1/L2 across consecutive
-                // task executions on the same thread.  The call takes a cpuset
-                // bitmask: we zero the entire mask and then set exactly one bit
-                // corresponding to our assigned logical CPU.
-                unsafe {
-                    let mut cpuset = std::mem::zeroed::<libc::cpu_set_t>();
-                    libc::CPU_SET(logical_cpu, &mut cpuset);
-                    let rc = libc::sched_setaffinity(
-                        // pid 0 means "the calling thread", which is exactly
-                        // the Tokio worker thread executing this closure.
-                        0,
-                        std::mem::size_of::<libc::cpu_set_t>(),
-                        &cpuset,
-                    );
-                    if rc != 0 {
-                        // Affinity failure is logged but not fatal.  If the OS
-                        // rejects the call (e.g. the process lacks CAP_SYS_NICE
-                        // or the CPU index is out of range for this kernel build)
-                        // the thread continues running unbound rather than
-                        // crashing the engine.  The operator should investigate
-                        // the error because unbound threads may drift onto
-                        // validator cores under heavy load.
-                        let errno = *libc::__errno_location();
-                        tracing::warn!(
-                            "solMevArb: sched_setaffinity failed for logical CPU {} \
-                             (errno {}); thread will run unbound",
-                            logical_cpu, errno,
-                        );
-                    }
-                }
-            })
-            .enable_all()
-            .build()
-            .expect("failed to build MEV Tokio runtime");
+        // Step 2: partition mints across shards.
+        //
+        // Each mint is assigned by `mint_pubkey[0] % NUM_SHARDS`. The pool data
+        // Arc is cloned (one atomic increment per mint) into the shard-init Vec.
+        // The engine retains its own Arc in mint_states.pool_data for the
+        // graduation path.
+        let mut startup_mints: Vec<Vec<Arc<MintPoolData>>> =
+            (0..NUM_SHARDS).map(|_| Vec::new()).collect();
 
-        info!(
-            "MevEngine: Tokio runtime created (12 worker threads, \
-             pinned to logical CPUs 12–23 / physical cores 12–23)"
-        );
-        rt.block_on(self.run_async());
-        info!("MevEngine: Tokio runtime shut down");
-    }
+        for (mint, state) in &self.mint_states {
+            let shard_idx = shard_for_mint(mint);
+            startup_mints[shard_idx].push(state.pool_data.load_full());
+        }
 
-    async fn run_async(mut self) {
-        info!(
-            "MevEngine: starting {} executor fan-out task(s) and background tasks",
-            self.pending_executor_starts.len()
-        );
+        // Step 3: spawn HTTP worker threads.
+        //
+        // HTTP threads are spawned before shard threads so that if a shard
+        // somehow produces a profitable item during its own initialisation
+        // (impossible in practice, but defensive), the HTTP consumer is already
+        // running.
+        for (shard_idx, http_consumer) in http_consumers.into_iter().enumerate() {
+            let logical_cpu = MEV_CORE_BASE + shard_idx;
+            let http_worker = HttpWorker::new(shard_idx, http_consumer);
 
-        let graduation_tx = self
-            .graduation_tx
-            .take()
-            .expect("graduation_tx consumed before run_async");
+            std::thread::Builder::new()
+                .name(format!("solMevHttp{:02}", shard_idx))
+                .spawn(move || {
+                    // HTTP threads share physical cores with shard threads
+                    // (two logical CPUs per physical core via SMT). The HTTP
+                    // thread spends 99% of its time blocked waiting for a TCP
+                    // response — it is I/O bound, not compute bound. SMT
+                    // sharing with the compute-bound shard thread is therefore
+                    // acceptable: the HTTP thread only needs the core when the
+                    // shard has just fired a submission, at which point the shard
+                    // is blocked on its ring buffer spinning on Empty.
+                    pin_thread_to_core(logical_cpu);
+                    http_worker.run();
+                })
+                .expect("HTTP thread spawn failed");
+        }
 
-        // The shredstream bridge is wrapped so that its exit is always logged.
-        // When the bridge exits — whether due to a permanent gRPC disconnect, a
-        // network partition, or a panic — the engine's select loop continues
-        // draining bank_rx and dead_slot_rx but receives no further graduation
-        // detections.  Without this log the operator has no way to distinguish a
-        // silent bridge failure from a period where no tracked pools were touched.
+        info!("MevEngine: spawned {} HTTP worker threads", NUM_SHARDS);
+
+        // Step 4: spawn shard threads.
+        //
+        // `startup_mints` and `http_producers` are zipped with `shard_consumers`
+        // so each shard receives exactly its ring buffer consumer, its HTTP producer,
+        // and its assigned mint data in one move. After this point the engine holds
+        // no reference to any shard's internal state.
+        for shard_idx in 0..NUM_SHARDS {
+            let logical_cpu = MEV_CORE_BASE + shard_idx;
+            let consumer      = shard_consumers.remove(0); // drains front-to-back in order
+            let http_producer = http_producers.remove(0);
+            let mints         = startup_mints.remove(0);
+
+            let shard = MevShard::new(
+                shard_idx,
+                consumer,
+                http_producer,
+                mints,
+                Arc::clone(&self.wallet),
+                Arc::clone(&self.lut_manager),
+                self.base_priority_fee,
+                self.min_profit_lamports,
+                self.jito_tip_lamports,
+                self.validation_mode,
+            );
+
+            std::thread::Builder::new()
+                .name(format!("solMevShard{:02}", shard_idx))
+                .spawn(move || {
+                    // Pin to the reserved MEV core. The validator occupies cores
+                    // 0–11; MEV shards own cores 12–23. No physical core is shared
+                    // between the two halves, eliminating L1/L2 cache competition
+                    // and execution-unit contention regardless of load.
+                    pin_thread_to_core(logical_cpu);
+                    shard.run();
+                })
+                .expect("shard thread spawn failed");
+        }
+
+        info!("MevEngine: spawned {} shard threads", NUM_SHARDS);
+
+        // Step 5: store shard producers on self so handle_mev_batch can push to them.
+        self.shard_producers = shard_producers;
+
+        // Step 6: spawn the shredstream graduation bridge on its own OS thread
+        // with a private `current_thread` Tokio runtime for its gRPC async code.
+        //
+        // Giving the bridge its own runtime decouples it entirely from the engine's
+        // select loop. The engine thread blocks on crossbeam::select! which is
+        // synchronous — no Tokio runtime is needed or wanted on the engine thread.
         {
-            let shredstream_url = self.shredstream_url.clone();
-            // Take the dedicated bridge dead-slot receiver. The engine echoes every
-            // dead slot it receives from replay_stage through this channel, giving the
-            // bridge a complete copy of every event without splitting the underlying
-            // queue (the old clone() approach caused non-deterministic message splitting
-            // because both endpoints consumed from the same channel).
-            let dead_slot_rx_for_bridge = self
+            let graduation_tx = self
+                .graduation_tx
+                .take()
+                .expect("graduation_tx consumed before run()");
+
+            let dead_slot_rx = self
                 .bridge_dead_slot_rx
                 .take()
-                .expect("bridge_dead_slot_rx taken twice — run_async called more than once");
-            tokio::spawn(async move {
-                crate::mev::shredstream_bridge::run_graduation_bridge(
-                    graduation_tx,
-                    dead_slot_rx_for_bridge,
-                    shredstream_url,
-                )
-                .await;
-                error!(
-                    "MevEngine: shredstream graduation bridge task exited — new pool \
-                     detection has stopped. The engine continues running against \
-                     existing pools but will not detect newly created ones until \
-                     the validator is restarted."
-                );
-            });
+                .expect("bridge_dead_slot_rx taken twice — run() called more than once");
+
+            let shredstream_url = self.shredstream_url.clone();
+
+            std::thread::Builder::new()
+                .name("solMevBridge".into())
+                .spawn(move || {
+                    // A `current_thread` Tokio runtime is sufficient: the bridge
+                    // has only one async task (the gRPC streaming loop). Using
+                    // current_thread avoids spawning worker threads that would
+                    // compete with shard threads for OS scheduling.
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("bridge Tokio runtime build failed");
+
+                    rt.block_on(async {
+                        crate::mev::shredstream_bridge::run_graduation_bridge(
+                            graduation_tx,
+                            dead_slot_rx,
+                            shredstream_url,
+                        )
+                        .await;
+
+                        // If the bridge exits, the engine continues processing
+                        // existing pools but will not detect newly created ones.
+                        error!(
+                            "MevEngine: shredstream graduation bridge exited — new pool \
+                             detection has stopped. Existing pools continue to be monitored \
+                             but the validator must be restarted to resume detection."
+                        );
+                    });
+                })
+                .expect("bridge thread spawn failed");
         }
 
-        for (executor, rx) in self.pending_executor_starts.drain(..) {
-            let sem = Arc::clone(&self.simulation_semaphore);
-            tokio::spawn(async move {
-                let mint = executor.pool_data_mint();
-                if let Err(e) = executor.start(rx, sem).await {
-                    error!(
-                        "ArbitrageExecutor for mint {} terminated with error: {}",
-                        mint, e
-                    );
-                }
-            });
-        }
+        info!("MevEngine: bridge thread spawned — entering select loop");
 
-        info!("MevEngine: event loop started");
-
+        // Step 7: synchronous crossbeam select! loop.
+        //
+        // No Tokio. No async. The engine thread blocks on the next message and
+        // returns to pure Rust immediately after handling it. Every microsecond
+        // here is a direct reduction in the time between batch-commit and the
+        // first rtrb push reaching the shard.
         loop {
             crossbeam_channel::select! {
                 recv(self.mev_batch_rx) -> msg => {
@@ -767,18 +597,13 @@ impl MevEngine {
                 }
 
                 recv(self.dead_slot_rx) -> msg => {
-                    // When the canonical replay pipeline marks a slot as dead, any
-                    // pool-creation transactions that were part of that slot will never
-                    // land on-chain.  Sweep pending_ready for all entries that belong
-                    // to the dead slot so they cannot produce false-positive graduation
-                    // events when future batches touch the same pool address.
                     if let Ok(dead_slot) = msg {
+                        // Sweep pending_ready entries for this dead slot.
                         self.pending_ready.retain(|_, v| v.slot != dead_slot);
 
-                        // Forward the dead slot to the bridge task so it can sweep its
-                        // per-DEX pending maps (pending_clmm, pending_whirlpool,
-                        // pending_dlmm). The send is best-effort: if the bridge has
-                        // exited (channel disconnected) the error is silently dropped.
+                        // Echo to bridge so it can clear its per-DEX pending maps.
+                        // Best-effort: if the bridge thread has exited, the error
+                        // is silently dropped — the engine continues running.
                         let _ = self.bridge_dead_slot_tx.send(dead_slot);
 
                         info!(
@@ -790,21 +615,13 @@ impl MevEngine {
                 }
 
                 recv(self.graduation_rx) -> msg => {
-                    // Phase 1 of the two-phase graduation pipeline completed in the bridge.
-                    // The bridge detected a pool-creation instruction in the raw entry stream
-                    // and sent the pool address, mints, and DEX type here. The engine stores
-                    // this in pending_ready. When a MevExecutedBatch arrives that contains
-                    // this pool address among committed accounts, Phase 2 fires to integrate
-                    // the pool into the arb graph using the bank from that batch.
+                    // Phase 1 graduation detection arrived from the bridge.
+                    // Store in pending_ready; Phase 2 fires in handle_mev_batch
+                    // when the creation transaction's batch commits.
                     if let Ok(detected) = msg {
-                        // Skip if this pool is already tracked — a second graduation event
-                        // for an already-registered pool address is redundant.
                         if self.account_to_mint.contains_key(&detected.pool_address) {
                             continue;
                         }
-
-                        // Enforce the cap to prevent adversarial pool-creation spam from
-                        // growing the map without bound.
                         if self.pending_ready.len() < MAX_PENDING_READY {
                             self.pending_ready.insert(detected.pool_address, detected);
                         } else {
@@ -819,52 +636,28 @@ impl MevEngine {
             }
         }
 
-        info!("MevEngine: event loop exited");
+        info!("MevEngine: select loop exited");
     }
 
-    /// Route a committed transaction batch to the correct per-mint executors.
+    // -----------------------------------------------------------------------
+    // Hot path — handle_mev_batch
+    // -----------------------------------------------------------------------
+
+    /// Route a committed transaction batch to the correct shards via rtrb.
     ///
-    /// Called every time `execute_batch()` in `blockstore_processor.rs` commits a
-    /// group of transactions to the canonical replay bank mid-slot.  The bank
-    /// carried in `batch` reflects ALL writes from every `Ok` commit result in this
-    /// batch and is immediately usable for simulation — no further waiting for slot
-    /// completion or `bank.freeze()`.
-    ///
-    /// The bank reference is the same `Arc<Bank>` that `execute_batch` was
-    /// operating on.  Because the Arc was cloned into the payload at commit time,
-    /// the bank is guaranteed to still be alive regardless of how quickly
-    /// BankForks evicts the slot — the Arc itself keeps the allocation alive
-    /// until the engine drops the batch.
-    ///
-    /// For every account that was touched by a committed transaction and that maps
-    /// to a tracked mint, a `MevPoolUpdateEvent` is broadcast to that mint's
-    /// `ArbitrageExecutor`.  The event carries the exact bank reference so the
-    /// executor can call `simulate_transaction_unchecked` directly against it.
+    /// This is the hottest function in the engine. Every call here is on the
+    /// path from `execute_batch()` in `blockstore_processor.rs` to the first
+    /// shard pop. The only allocations on this path are the `ShardWorkItem`
+    /// pushes themselves (each carries an `Arc<Bank>` clone — one atomic
+    /// increment per matched account).
     fn handle_mev_batch(&mut self, batch: MevExecutedBatch) {
         let slot = batch.slot;
 
-        // The BankForks confirmed root is the highest slot that has received
-        // supermajority vote confirmation from the cluster.  Under normal
-        // Solana consensus this root trails the active working bank by roughly
-        // 32 slots — the time it takes for 2/3 of stake to vote and for those
-        // votes to themselves be rooted.
-        //
-        // During catchup replay the validator processes thousands of historical
-        // slots per second.  Each batch fired during replay carries a slot number
-        // from the past while the root has already advanced to the network tip,
-        // so the gap between root and batch.slot is in the thousands.  Those
-        // batches carry pool prices the market moved past long ago: simulating
-        // against them spawns tasks that consume semaphore permits, fill the
-        // Tokio task queue, and bury genuinely live events behind minutes of
-        // stale work — exactly the runaway latency observed in production.
-        //
-        // 150 slots of headroom above the normal ~32-slot lag absorbs transient
-        // cluster conditions (leader skips, network partitions, delayed votes)
-        // while remaining orders of magnitude below the thousands-of-slots gap
-        // that uniquely identifies catchup.  Any batch with a gap larger than
-        // 150 slots is discarded immediately — zero events broadcast, zero tasks
-        // spawned, semaphore untouched — so the engine arrives at the live tip
-        // with a completely clean queue and full semaphore budget.
+        // Root-slot staleness guard. During catchup replay the validator processes
+        // thousands of historical slots per second. A gap > 150 slots from the
+        // root uniquely identifies catchup (the normal live gap is ~32 slots).
+        // Any batch from catchup carries pool prices the market moved past long
+        // ago — zero events produced, zero rtrb pushes, semaphore untouched.
         if self.root_slot.get().saturating_sub(slot) > 150 {
             return;
         }
@@ -872,14 +665,22 @@ impl MevEngine {
         let bank = &batch.bank;
         let blockhash = bank.last_blockhash();
 
+        // Stamp the batch-commit instant once and reuse it for every ShardWorkItem
+        // created from this batch. All events from the same batch share the same
+        // origin time — the moment the canonical bank committed these transactions.
+        let batch_instant = Instant::now();
+
+        // Per-batch deduplication: multiple transactions in one batch can write the
+        // same pool account. clear() reuses the backing allocation with zero heap
+        // activity on the hot path.
+        self.seen_this_batch.clear();
+
         // Drain any graduation events that arrived for this batch before scanning
         // the account map. The bridge sends graduation_tx before the entry that
         // produced these commits is fully processed, so every DetectedPool for
-        // this batch is typically already in graduation_rx by the time this batch
-        // arrives here. Absorbing them first ensures that when the per-account loop
-        // below encounters an untracked address that is in pending_ready, the
-        // pending_ready entry was inserted BEFORE the loop rather than being missed
-        // because select! dispatched mev_batch_rx before graduation_rx for this pair.
+        // this batch is typically already queued by the time this batch arrives.
+        // Absorbing them first ensures the per-account loop below can find them
+        // in pending_ready when it encounters the untracked pool address.
         while let Ok(g) = self.graduation_rx.try_recv() {
             if !self.account_to_mint.contains_key(&g.pool_address) {
                 if self.pending_ready.len() < MAX_PENDING_READY {
@@ -888,19 +689,6 @@ impl MevEngine {
             }
         }
 
-        // Walk the committed transactions and collect every account address that
-        // a successfully committed transaction wrote.  `TransactionCommitResult`
-        // does not carry the write-set directly — but the bank has already applied
-        // all writes, so we use the transaction's static account keys as the
-        // routing signal: if a tracked pool address appears as a writable account
-        // in any successfully committed transaction, the pool's state has changed.
-        //
-        // This is a routing heuristic, not a precise write-set: a transaction that
-        // touches a pool account but produces no actual state change (e.g. a failed
-        // inner instruction that reverts) will still trigger a simulation.  That is
-        // acceptable — the simulation itself will observe no profitable price
-        // discrepancy and return without submitting.  A false negative (missing a
-        // real state change) would be worse than a false positive.
         use solana_svm::transaction_commit_result::TransactionCommitResultExtensions;
         let mut events_sent: u32 = 0;
 
@@ -912,32 +700,36 @@ impl MevEngine {
             for account_key in tx.message().account_keys().iter() {
                 match self.account_to_mint.get(account_key) {
                     Some(mint) => {
-                        let state = match self.mint_states.get(mint) {
-                            Some(s) => s,
-                            None => continue,
-                        };
+                        // Deduplicate: at most one event per pool address per batch.
+                        // insert() returns false when already present — skip to
+                        // prevent duplicate bundle submissions in production mode.
+                        if !self.seen_this_batch.insert(*account_key) {
+                            continue;
+                        }
 
-                        let event = MevPoolUpdateEvent {
+                        // Route to the shard that owns this mint. The routing function
+                        // is a single modulo — no map lookup, no branch beyond the mod.
+                        let shard_idx = shard_for_mint(mint);
+
+                        let item = ShardWorkItem::PoolUpdate {
                             pool_address: *account_key,
                             bank: Arc::clone(bank),
                             blockhash,
-                            // Stamp the batch-commit time as the event's true origin.
-                            // The executor uses created_at.elapsed() for both staleness
-                            // guards and the end-to-end latency log field. Measuring from
-                            // dequeue time in the fan-out loop understates event age when
-                            // events sit in the broadcast ring buffer under load.
-                            created_at: Instant::now(),
+                            // All events from this batch share the batch-commit
+                            // timestamp for consistent latency measurement.
+                            created_at: batch_instant,
                         };
 
-                        match state.pool_update_tx.send(event) {
-                            Ok(_) => { events_sent += 1; }
-                            Err(e) => {
-                                // A send error on a broadcast channel means there are no
-                                // active receivers — all ArbitrageExecutor tasks for this
-                                // mint have exited. This is unusual and worth logging.
-                                warn!(
-                                    "MevEngine: pool_update_tx send error for mint {}: {}",
-                                    mint, e
+                        // PoolUpdate is dropped on Full — if the shard's ring buffer
+                        // is full the event is stale by the time it would be processed
+                        // anyway (the staleness guard on the shard side would drop it).
+                        match self.shard_producers[shard_idx].push(item) {
+                            Ok(()) => { events_sent += 1; }
+                            Err(_) => {
+                                debug!(
+                                    "MevEngine: shard {} ring buffer full — \
+                                     dropping PoolUpdate for {}",
+                                    shard_idx, account_key
                                 );
                             }
                         }
@@ -945,10 +737,9 @@ impl MevEngine {
 
                     None => {
                         // Check whether this untracked account is a newly created pool
-                        // address that Phase 1 registered in pending_ready. If so, Phase
-                        // 2 fires to integrate it into the arb graph using the bank that
-                        // just committed its creation transaction — the freshest possible
-                        // state, available immediately after the creation succeeded.
+                        // whose Phase 1 detection is in pending_ready. If so, Phase 2
+                        // fires to integrate it into the arb graph using the bank that
+                        // just committed its creation transaction.
                         if let Some(detected) = self.pending_ready.remove(account_key) {
                             self.handle_pool_graduation(detected, bank);
                         }
@@ -959,30 +750,27 @@ impl MevEngine {
 
         if events_sent > 0 {
             debug!(
-                "MevEngine: slot {} batch committed — {} pool-update event(s) broadcast",
+                "MevEngine: slot {} batch — {} pool-update event(s) pushed to shards",
                 slot, events_sent
             );
         }
     }
 
-    /// Handle a frozen canonical bank delivered directly by `ReplayStage`.
+    // -----------------------------------------------------------------------
+    // Frozen bank handler (graduation fallback)
+    // -----------------------------------------------------------------------
+
+    /// Handle a frozen canonical bank delivered by `ReplayStage`.
     ///
-    /// At this point the slot is complete and the bank hash is finalized.  The
-    /// engine uses the frozen bank only as a fallback for graduation processing:
-    /// if a pool-creation transaction was the last transaction in a slot, its
-    /// creation may have arrived via `handle_mev_batch` already.  This handler
-    /// ensures that any pending graduation that was not triggered mid-slot is
-    /// resolved once the slot is fully committed.
+    /// Used as a fallback for graduation processing: if a pool-creation
+    /// transaction was the last transaction in a slot, its creation may not
+    /// have been caught by `handle_mev_batch`. This handler ensures any pending
+    /// graduation is resolved once the slot is fully committed.
     fn handle_frozen_bank(&mut self, bank: Arc<Bank>) {
         let slot = bank.slot();
 
-        // Drain any graduation events that are still queued and attempt to match
-        // them against the now-frozen bank. This covers the edge case where the
-        // bridge detected a pool creation in a batch that also happened to be the
-        // final batch of the slot — the graduation event may have arrived in the
-        // channel slightly after the mev_batch for that same creation, causing
-        // pending_ready to be populated after handle_mev_batch already processed
-        // the relevant accounts.
+        // Drain any graduation events still queued and attempt to match them
+        // against the now-frozen bank.
         while let Ok(g) = self.graduation_rx.try_recv() {
             if !self.account_to_mint.contains_key(&g.pool_address) {
                 if self.pending_ready.len() < MAX_PENDING_READY {
@@ -991,8 +779,8 @@ impl MevEngine {
             }
         }
 
-        // Attempt graduation for any pool whose creation was detected in this slot
-        // and whose account now exists in the frozen canonical bank.
+        // Try to graduate any pool whose creation was detected in this slot and
+        // whose account now exists in the frozen canonical bank.
         let detected_in_slot: Vec<Pubkey> = self
             .pending_ready
             .iter()
@@ -1011,52 +799,44 @@ impl MevEngine {
         debug!("MevEngine: slot {} canonical freeze processed", slot);
     }
 
+    // -----------------------------------------------------------------------
+    // Graduation — Phase 2
+    // -----------------------------------------------------------------------
+
     /// Phase 2 of the graduation pipeline.
     ///
-    /// Called when a committed `MevExecutedBatch` (or a frozen canonical bank at
-    /// slot completion) confirms that the pool-creation transaction succeeded.
-    /// At this point `bank.get_account(pool_address)` returns the freshly written
-    /// pool state account — all sub-accounts (vaults, tick arrays, oracles) created
-    /// in the same transaction are also present in the bank.
+    /// Called when a committed `MevExecutedBatch` (or a frozen canonical bank)
+    /// confirms the pool-creation transaction succeeded.
     ///
     /// ## Known mint path
     ///
-    /// If the non-quote token of the new pool is already tracked by a running
-    /// `ArbitrageExecutor`, the pool is fully integrated:
+    /// If the non-quote token is already tracked by a running `MevShard`:
     ///
-    /// 1. `initialize_mint_from_discovered` reads the new pool's vault addresses,
-    ///    tick arrays, and oracle accounts directly from the bank's write cache.
-    ///
-    /// 2. The current `MintPoolData` is atomically replaced via `ArcSwap::store`.
-    ///    The executor's next `load()` call returns the new version.
-    ///
-    /// 3. All new accounts are registered in `account_to_mint`,
-    ///    `cached_accounts_to_watch`, and `arb_graph` so that vault reserve changes
-    ///    trigger re-evaluation of arb pairs through this pool.
+    ///   1. `initialize_mint_from_discovered` reads the new pool's vault addresses
+    ///      from the bank.
+    ///   2. The current `MintPoolData` is cloned and updated, then stored via
+    ///      `ArcSwap::store` so the engine's own state is current.
+    ///   3. A `GraduatePool` work item is pushed to the owning shard. The shard
+    ///      calls `graph.add_pool()` on its owned `ArbitrageGraph` and replaces
+    ///      its pool data reference — no lock, no coordination.
     ///
     /// ## Unknown mint path
     ///
-    /// If the non-quote token has not been seen before, `initialize_mint_from_discovered`
-    /// is called synchronously with the bank.  On success, `register_mint` is called
-    /// and the executor is spawned immediately.
+    /// If the non-quote token has not been seen before:
+    ///
+    ///   1. `initialize_mint_from_discovered` produces a full `MintPoolData`.
+    ///   2. `register_mint` builds the engine's `MintState` and sends a
+    ///      `RegisterMint` work item to the correct shard.
     fn handle_pool_graduation(
         &mut self,
         detected: DetectedPool,
         bank: &Arc<Bank>,
     ) {
-        // Confirm the pool account exists in the bank. If the creation transaction
-        // failed within this batch, the pool address is absent — skip silently.
         if bank.get_account(&detected.pool_address).is_none() {
             return;
         }
 
-        // Identify which token is the speculative (non-quote) side of this pool.
-        // The arb model is SOL-only: SOL is the sole quote currency. Any pool whose
-        // both sides are non-SOL is rejected — the speculative mint selection below
-        // would otherwise yield a quote token as the intermediate, corrupting the graph.
-        let is_quote = |m: &Pubkey| -> bool {
-            *m == SOL_MINT
-        };
+        let is_quote = |m: &Pubkey| *m == SOL_MINT;
 
         let mint = if !is_quote(&detected.mint0) {
             detected.mint0
@@ -1064,17 +844,13 @@ impl MevEngine {
             detected.mint1
         };
 
-        // Both-quote pools (SOL/USDC, USDC/USDT, etc.) pass the has_quote_token
-        // filter in the graduation detector because at least one side is a quote
-        // token. But BOTH sides are quote tokens, so the selection above yields a
-        // quote token as the "speculative mint". Quote tokens are the denominators
-        // of the arb model — they are never the intermediate speculative token.
-        // Registering one as a speculative mint would corrupt the graph.
+        // Both-SOL pools (e.g. SOL/USDC where both sides are quote tokens)
+        // are filtered here. `mint` would resolve to a quote token which cannot
+        // be the speculative intermediate in the arb model.
         if is_quote(&mint) {
             return;
         }
 
-        // Map the graduation source to the pool type used in the arb graph.
         let pool_type = match detected.source {
             GraduationSource::PumpSwap      => PoolType::PumpSwap,
             GraduationSource::RaydiumClmm   => PoolType::RaydiumClmm,
@@ -1093,56 +869,63 @@ impl MevEngine {
         };
 
         if self.mint_states.contains_key(&mint) {
+            // Known-mint path.
             let discovered = build_single_pool_discovered(&detected);
 
-            let new_accounts: Vec<Pubkey> = match initialize_mint_from_discovered(
+            // Initialised in the match arms below. The Ok arm builds the Arc
+            // and stores it atomically; the same Arc is forwarded to the shard,
+            // avoiding a redundant load_full() call after the store.
+            let new_accounts: Vec<Pubkey>;
+            let updated_pool_data: Arc<MintPoolData>;
+
+            match initialize_mint_from_discovered(
                 &mint,
                 discovered,
                 &self.wallet.pubkey(),
                 bank,
             ) {
                 Ok(init) => {
-                    // The only new account to track is the pool address itself. Building
-                    // a full ArbitrageGraph for a single-pool MintPoolData just to call
-                    // all_tracked_accounts() allocated an entire graph structure, ran the
-                    // pair-building loop, and then discarded everything except one pubkey.
-                    // The direct vec avoids all of that work.
-                    let accounts = vec![detected.pool_address];
-
-                    {
-                        let state = self.mint_states.get(&mint).unwrap();
-                        let current: Arc<MintPoolData> = state.pool_data.load_full();
-                        let mut updated: MintPoolData = (*current).clone();
-                        updated.merge_pools_from(init.pool_data);
-                        state.pool_data.store(Arc::new(updated));
-                    }
-
-                    accounts
+                    // Only the pool address itself needs to be registered as a new
+                    // account to watch. A full graph build just to get the account
+                    // list would allocate the entire graph structure and throw it
+                    // away — wasteful for a single-pool addition.
+                    let state = self.mint_states.get(&mint).unwrap();
+                    let current: Arc<MintPoolData> = state.pool_data.load_full();
+                    let mut updated: MintPoolData = (*current).clone();
+                    updated.merge_pools_from(init.pool_data);
+                    // Build the Arc once. Arc::clone increments the refcount so
+                    // ArcSwap::store gets its own owner and `updated_pool_data`
+                    // gets its own owner — no second atomic load needed.
+                    let new_arc = Arc::new(updated);
+                    state.pool_data.store(Arc::clone(&new_arc));
+                    new_accounts = vec![detected.pool_address];
+                    updated_pool_data = new_arc;
                 }
                 Err(e) => {
                     warn!(
                         "MevEngine: known-mint graduation vault extraction failed for \
-                         {:?} pool {} mint {}: {} — pairs wired, simulation degraded",
+                         {:?} pool {} mint {}: {} — wiring pairs with pool address only",
                         detected.source, detected.pool_address, mint, e
                     );
-                    vec![detected.pool_address]
+                    new_accounts = vec![detected.pool_address];
+                    // Vault extraction failed but we still send the shard the
+                    // current pool data so it can wire the new pool address into
+                    // the graph. load_full() is only called on this error branch.
+                    updated_pool_data = self
+                        .mint_states
+                        .get(&mint)
+                        .map(|s| s.pool_data.load_full())
+                        .expect("mint state must exist — checked above");
                 }
             };
 
-            let new_pairs = {
-                let state = self.mint_states.get(&mint).unwrap();
-                // Acquire the write lock to insert the new pool into the live arb
-                // graph. Recover from a poisoned lock: a panic inside add_pool on a
-                // previous call would have unwound cleanly; the graph remains
-                // structurally consistent and the new pool can still be inserted.
-                let mut graph = state.arb_graph.write().unwrap_or_else(|p| p.into_inner());
-                graph.add_pool(pool_info, &new_accounts)
-            };
-
+            // Register new accounts in the engine's reverse index so future
+            // batches that touch the new pool address are routed correctly.
             for account in &new_accounts {
                 self.account_to_mint.insert(*account, mint);
             }
 
+            // Update the watch list.
             {
                 let current = self.cached_accounts_to_watch.load();
                 let mut new_vec: Vec<Pubkey> = (**current).clone();
@@ -1155,20 +938,37 @@ impl MevEngine {
                 self.cached_accounts_to_watch.store(Arc::new(new_vec));
             }
 
+            // Update tracked_accounts on the MintState.
             if let Some(state) = self.mint_states.get_mut(&mint) {
                 state.tracked_accounts.extend_from_slice(&new_accounts);
             }
 
+            // Push GraduatePool work item to the owning shard.
+            // This must not be dropped — use spin-retry.
+            let shard_idx = shard_for_mint(&mint);
+            let new_pairs_count = new_accounts.len(); // approximate for logging
+
+            self.push_critical_item(
+                shard_idx,
+                ShardWorkItem::GraduatePool {
+                    mint,
+                    pool_info,
+                    pool_accounts: new_accounts,
+                    updated_pool_data,
+                },
+            );
+
             info!(
-                "MevEngine: graduated new {:?} pool {} into known mint {} — {} new pair(s), \
-                 {} account(s) registered",
+                "MevEngine: graduated new {:?} pool {} into known mint {} — \
+                 ~{} account(s) registered → shard {}",
                 detected.source,
                 detected.pool_address,
                 mint,
-                new_pairs,
-                new_accounts.len(),
+                new_pairs_count,
+                shard_idx,
             );
         } else {
+            // Unknown-mint path.
             let discovered = build_single_pool_discovered(&detected);
 
             match initialize_mint_from_discovered(
@@ -1182,29 +982,8 @@ impl MevEngine {
                         "MevEngine: graduated new mint {} from {:?} pool {}",
                         mint, detected.source, detected.pool_address,
                     );
+                    // register_mint builds MintState and sends RegisterMint to shard.
                     self.register_mint(Arc::new(init.pool_data));
-
-                    let idx = self
-                        .pending_executor_starts
-                        .iter()
-                        .position(|(exec, _)| exec.pool_data_mint() == mint);
-
-                    if let Some(idx) = idx {
-                        let (executor, rx) = self.pending_executor_starts.remove(idx);
-                        let sem = Arc::clone(&self.simulation_semaphore);
-                        tokio::spawn(async move {
-                            if let Err(e) = executor.start(rx, sem).await {
-                                error!(
-                                    "ArbitrageExecutor for graduated mint {} terminated: {}",
-                                    mint, e
-                                );
-                            }
-                        });
-                        info!(
-                            "MevEngine: executor spawned for graduated mint {}",
-                            mint
-                        );
-                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1215,6 +994,118 @@ impl MevEngine {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Ring buffer helpers
+    // -----------------------------------------------------------------------
+
+    /// Push a critical work item (RegisterMint or GraduatePool) to a shard's
+    /// ring buffer, spinning with `yield_now()` until space is available.
+    ///
+    /// Unlike `PoolUpdate` items which are dropped on Full (they are stale by
+    /// definition), critical items must never be dropped: a missed `RegisterMint`
+    /// means a mint is permanently invisible to the shard; a missed `GraduatePool`
+    /// means a new pool is never wired into the arb graph. The spin is safe
+    /// because the shard drains its buffer continuously and the graduation path
+    /// is cold (rare events at most a handful per slot).
+    fn push_critical_item(&mut self, shard_idx: usize, mut item: ShardWorkItem) {
+        loop {
+            match self.shard_producers[shard_idx].push(item) {
+                Ok(()) => break,
+                Err(rtrb::PushError::Full(returned)) => {
+                    item = returned;
+                    // Yield the engine thread's timeslice so the shard thread can
+                    // drain. Under normal conditions the shard empties its 512-slot
+                    // buffer in microseconds — this loop should never iterate more
+                    // than once or twice.
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+/// Compute which shard owns a given mint.
+///
+/// The first byte of the mint's on-chain address, mod NUM_SHARDS. This is
+/// computed from the address itself — no table lookup, no heap allocation,
+/// no synchronisation.  The assignment is bijective and stable across the
+/// validator's lifetime: once a mint is assigned to shard N it always routes
+/// to shard N.
+#[inline(always)]
+fn shard_for_mint(mint: &Pubkey) -> usize {
+    mint.to_bytes()[0] as usize % NUM_SHARDS
+}
+
+// ---------------------------------------------------------------------------
+// CPU pinning
+// ---------------------------------------------------------------------------
+
+/// Pin the calling thread to a specific logical CPU using `sched_setaffinity(2)`.
+///
+/// On failure (e.g. the process lacks `CAP_SYS_NICE`, or the CPU index is out
+/// of range for this kernel build), the thread continues running unbound rather
+/// than crashing. The operator should investigate the warning because unbound
+/// threads may drift onto validator cores under heavy load.
+fn pin_thread_to_core(logical_cpu: usize) {
+    unsafe {
+        let mut cpuset = std::mem::zeroed::<libc::cpu_set_t>();
+        libc::CPU_SET(logical_cpu, &mut cpuset);
+        let rc = libc::sched_setaffinity(
+            0, // pid 0 = calling thread
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &cpuset,
+        );
+        if rc != 0 {
+            let errno = *libc::__errno_location();
+            warn!(
+                "sched_setaffinity failed for logical CPU {} (errno {}) — \
+                 thread will run unbound",
+                logical_cpu, errno
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup account extractor
+// ---------------------------------------------------------------------------
+
+/// Extract all pool account pubkeys from `pool_data` without building a full
+/// `ArbitrageGraph`.
+///
+/// `ArbitrageGraph::build_with_config` performs pair analysis and deduplication
+/// — work the engine does not need at startup. This function reads only the
+/// account addresses from each pool type's Vec, exactly as
+/// `build_account_to_pool_map` does inside `arbitrage_graph.rs`, and returns
+/// them as a plain `Vec<Pubkey>`.
+///
+/// Cost: O(total_pools) — one push per pool with no HashMap construction and
+/// no pair-matching loop. Roughly 10–50× cheaper than a full graph build for
+/// a typical mint with < 10 pools.
+fn extract_tracked_accounts(pool_data: &MintPoolData) -> Vec<Pubkey> {
+    let mut accounts: Vec<Pubkey> = Vec::new();
+
+    for pool in &pool_data.raydium_pools        { accounts.push(pool.pool); }
+    for pool in &pool_data.raydium_cp_pools     { accounts.push(pool.pool); }
+    for pool in &pool_data.raydium_clmm_pools   { accounts.push(pool.pool); }
+    for pool in &pool_data.pump_pools           { accounts.push(pool.pool); }
+    for pool in &pool_data.meteora_damm_pools   { accounts.push(pool.pool); }
+    for pool in &pool_data.meteora_damm_v2_pools{ accounts.push(pool.pool); }
+    for pool in &pool_data.dlmm_pairs           { accounts.push(pool.pair); }
+    for pool in &pool_data.whirlpool_pools      { accounts.push(pool.pool); }
+    for pool in &pool_data.byreal_pools         { accounts.push(pool.pool); }
+    for pool in &pool_data.pancakeswap_pools    { accounts.push(pool.pool); }
+    for pool in &pool_data.humidifi_pools       { accounts.push(pool.pool); }
+    for pool in &pool_data.vertigo_pools        { accounts.push(pool.pool); }
+    for pool in &pool_data.heaven_pools         { accounts.push(pool.pool); }
+    for pool in &pool_data.futarchy_pools       { accounts.push(pool.dao); }
+
+    accounts
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,12 +1113,8 @@ impl MevEngine {
 // ---------------------------------------------------------------------------
 
 /// Build a `DiscoveredPools` containing exactly one pool entry for the given
-/// `DetectedPool`.
-///
-/// `initialize_mint_from_discovered` expects a `DiscoveredPools` struct where each
-/// DEX's pools are listed in the appropriate `Vec<Pubkey>` field.  When graduating
-/// a single newly created pool, only one field is populated — the rest remain empty
-/// Vecs that the parser skips with an early `Ok(Vec::new())` return.
+/// `DetectedPool`. `initialize_mint_from_discovered` expects a `DiscoveredPools`
+/// where each DEX's pools are listed in the appropriate `Vec<Pubkey>` field.
 fn build_single_pool_discovered(detected: &DetectedPool) -> DiscoveredPools {
     let mut d = DiscoveredPools::new();
     match detected.source {
@@ -1316,5 +1203,24 @@ mod tests {
             received, dead_slot,
             "dead slot value must be preserved exactly through the channel"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 3 — shard_for_mint routing
+    // -------------------------------------------------------------------------
+
+    /// Verifies that `shard_for_mint` always returns a value in [0, NUM_SHARDS)
+    /// and that the routing is deterministic for the same mint.
+    #[test]
+    fn test_shard_for_mint_deterministic_and_bounded() {
+        use solana_pubkey::Pubkey;
+
+        for _ in 0..1000 {
+            let mint = Pubkey::new_unique();
+            let idx_a = shard_for_mint(&mint);
+            let idx_b = shard_for_mint(&mint);
+            assert!(idx_a < NUM_SHARDS, "shard index must be < NUM_SHARDS");
+            assert_eq!(idx_a, idx_b, "shard routing must be deterministic");
+        }
     }
 }

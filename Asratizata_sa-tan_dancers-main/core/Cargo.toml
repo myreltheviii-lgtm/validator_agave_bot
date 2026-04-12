@@ -85,11 +85,28 @@ qualifier_attr = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+# The `blocking` feature enables reqwest::blocking::Client, a synchronous HTTP
+# client that wraps a Tokio runtime internally but exposes a plain call/return
+# interface.  HttpWorker runs on a dedicated OS thread with no ambient Tokio
+# runtime; using the blocking client there is the correct pattern — it avoids
+# the overhead of spawning a runtime per-request while keeping the HTTP logic
+# off the async executor entirely.  The `json` feature enables response.json()
+# deserialisation via serde_json, used to parse the JSON-RPC reply from the
+# Helius Sender endpoint.
+reqwest = { workspace = true, features = ["json", "blocking"] }
 rayon = { workspace = true }
 rolling-file = { workspace = true }
 rustls = { workspace = true }
 rustc-hash = "2.1.0"
+# rtrb is a single-producer single-consumer (SPSC) lock-free ring buffer.
+# It is not present in the workspace dependency table because it is used
+# exclusively by the MEV subsystem inside solana-core; no other workspace
+# crate depends on it.  The ring buffer delivers ~5–20 ns push/pop latency
+# versus ~1–5 µs for a futex-backed channel, which is the primary reason the
+# MEV engine uses it on the hot path between the engine thread and each of
+# the twelve MevShard threads, and again between each shard and its paired
+# HttpWorker thread.
+rtrb = "0.3"
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }
