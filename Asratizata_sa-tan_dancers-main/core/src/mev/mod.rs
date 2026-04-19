@@ -23,10 +23,14 @@
 //!     pool_parser.rs
 //!     pool_scanner.rs
 //!     pool_tracker.rs
-//!   lut_helpers.rs       ← fetch_address_lookup_table_account helpers
-//!   lut_manager.rs       ← LutManager, LutConfig, load_lut_addresses_from_env
-//!   pools.rs             ← MintPoolData, RaydiumPool, …, FutarchyPool
-//!   asratizata__.rs      ← initialize_mev_components, MevStartupConfig, MevStartupResult
+//!   lut_helpers.rs        ← fetch_address_lookup_table_account helpers
+//!   lut_manager.rs        ← LutManager, LutConfig, load_lut_addresses_from_env
+//!   pools.rs              ← MintPoolData, RaydiumPool, …, FutarchyPool
+//!   stages/               ← sequential simulation pipeline stages
+//!     mod.rs              ← pub mod fangzhen_jieduan; pub mod sanre_jieduan;
+//!     fangzhen_jieduan.rs ← ternary search via sim-server, BestSimResult
+//!     sanre_jieduan.rs    ← 400 ms per-pair cooldown gate, CoolingStage
+//!   asratizata__.rs       ← initialize_mev_components, MevStartupConfig, MevStartupResult
 //! ```
 //!
 //! # Conditional activation
@@ -94,6 +98,25 @@ pub mod pools;
 /// `MevEngine::run_async()`.
 pub mod shredstream_bridge;
 
+/// Simulation pipeline stages.
+///
+/// The `stages/` directory contains the two sequential gates that sit between
+/// the shard's qualifying-pair enumeration and the final transaction build:
+///
+/// - `fangzhen_jieduan` (仿真阶段 — Simulation Stage): runs a ternary search
+///   over `amount_in` via the sim-server Unix socket for every qualifying pair
+///   and returns the single most profitable opportunity. Replaces the SVM-based
+///   `simulate_transaction_unchecked` path for pre-flight profitability signals.
+///
+/// - `sanre_jieduan` (冷却阶段 — Cooling Stage): suppresses duplicate
+///   transaction submissions for the same arbitrage pair within one Solana slot
+///   window (400 ms), preventing redundant bundles from racing each other for
+///   the same opportunity.
+///
+/// Both stages are called sequentially inside `MevShard::handle_pool_update`
+/// in `executor/mod.rs` before any transaction is built or submitted.
+pub mod stages;
+
 /// One-time MEV initialisation sequence: wallet load, RPC client, LUT manager,
 /// pool scan, pool parse loop.
 ///
@@ -120,4 +143,3 @@ pub use loaders::{
 pub use lut_manager::LutManager;
 pub use pools::MintPoolData;
 pub use Asratizata__::{initialize_mev_components, MevStartupConfig, MevStartupResult};
-

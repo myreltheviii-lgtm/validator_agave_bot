@@ -96,6 +96,20 @@ members = [
     "scheduler-bindings",
     "scheduling-utils",
     "send-transaction-service",
+    # sim-client is the zero-SDK shared IPC contract between the Agave validator
+    # and the companion sim-server process. It lives inside the workspace so that:
+    #   1. Workspace members (core, ledger, etc.) can declare it via
+    #      `sim-client = { workspace = true }` without repeating the path.
+    #   2. A single `cargo build --workspace` compiles it together with the
+    #      validator, catching any type mismatches between the two consumers at
+    #      compile time rather than at runtime on the Unix socket.
+    #   3. The workspace version pin in [workspace.dependencies] below applies
+    #      uniformly — no risk of the validator and sim-server depending on
+    #      different versions of the wire types.
+    # The sim-server binary lives outside this workspace and references sim-client
+    # via `sim-client = { path = "../sim-client" }`. That path dep is resolved
+    # independently; it does not conflict with this workspace membership.
+    "sim-client",
     "snapshots",
     "stake-accounts",
     "storage-bigtable",
@@ -384,6 +398,12 @@ sha3 = "0.10.8"
 shaq = { version = "1.0.2" }
 shuttle = "0.7.1"
 signal-hook = "0.4.3"
+# sim-client is the zero-SDK IPC contract crate shared between the validator
+# and the sim-server process. Declaring it here means any workspace member
+# (core, ledger, etc.) can reference it as `sim-client = { workspace = true }`
+# without repeating the path. The version pin matches [workspace.package] so
+# `cargo publish` and workspace-level version bumps stay in sync automatically.
+sim-client = { path = "sim-client", version = "=4.1.0-alpha.0" }
 siphasher = "1.0.2"
 slab = "0.4.12"
 smallvec = { version = "1.15.1", default-features = false, features = ["union"] }

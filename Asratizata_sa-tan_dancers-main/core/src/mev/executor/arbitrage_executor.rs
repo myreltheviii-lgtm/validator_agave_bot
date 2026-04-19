@@ -58,6 +58,26 @@ use {
     tracing::{debug, info, warn},
 };
 
+// sim_client is the zero-SDK shared IPC contract crate. SimClient lives on
+// each shard thread and owns one persistent Unix socket connection to the
+// sim-server process. The connection is lazy — established on the first query()
+// call — so constructing a SimClient in MevShard::new() is free.
+use sim_client::SimClient;
+
+// fangzhen_jieduan (仿真阶段) is the simulation stage. It receives the
+// qualifying pairs for a pool update, runs a ternary search over amount_in
+// via the sim-server, and returns the single most profitable opportunity.
+// Delegating pair evaluation here keeps handle_pool_update focused on routing
+// and dispatching rather than search strategy.
+use crate::mev::stages::fangzhen_jieduan;
+
+// sanre_jieduan (冷却阶段) is the cooling stage. It prevents duplicate
+// transaction submissions for the same pair within one Solana slot window
+// (400 ms). A pool update can retrigger the same profitable pair dozens of
+// times before the first submission lands on-chain; without rate-limiting
+// every re-fire races the first submission for the same arb profit.
+use crate::mev::stages::sanre_jieduan::CoolingStage;
+
 // ---------------------------------------------------------------------------
 // Work items — the types that flow through the rtrb ring buffers
 // ---------------------------------------------------------------------------
@@ -292,6 +312,29 @@ pub struct MevShard {
     /// When true, run full inline SVM simulation and log results without submitting.
     /// When false, build the transaction and push it to the HTTP worker immediately.
     validation_mode: bool,
+    /// Persistent Unix socket client connecting this shard to the sim-server process.
+    ///
+    /// One SimClient per shard means one socket connection per shard — no lock
+    /// contention, no shared state across shards. The connection is established
+    /// lazily on the first query() call and then reused for the shard's lifetime.
+    /// On any I/O error the client drops the broken socket and reconnects on the
+    /// next call, transparently handling sim-server restarts.
+    sim_client: SimClient,
+    /// Per-pair cooldown tracker that suppresses duplicate submissions within one
+    /// Solana slot window (400 ms).
+    ///
+    /// A single pool update can cause the same profitable pair to appear in the
+    /// shard's ring buffer dozens of times before the first submitted transaction
+    /// lands on-chain. Without rate-limiting, each re-fire would race the first
+    /// submission for the same arb profit, burning priority fees on redundant
+    /// transactions that all chase the same opportunity.
+    cooling: CoolingStage,
+    /// Upper bound on the amount_in the ternary search will probe, in lamports.
+    ///
+    /// The search converges to the profit-maximising amount_in within this ceiling.
+    /// Setting it to the operator's available capital prevents the search from
+    /// probing amounts the wallet cannot actually fund.
+    max_capital_lamports: u64,
 }
 
 impl MevShard {
@@ -303,30 +346,40 @@ impl MevShard {
     /// map. This is the only time graphs are built on the engine's thread — after
     /// startup, graduation work items trigger graph builds on the shard thread itself.
     pub fn new(
-        shard_idx: usize,
-        consumer: rtrb::Consumer<ShardWorkItem>,
-        http_producer: rtrb::Producer<HttpWorkItem>,
-        startup_mints: Vec<Arc<MintPoolData>>,
-        wallet: Arc<Keypair>,
-        lut_manager: Arc<LutManager>,
-        base_priority_fee: u64,
-        min_profit_lamports: u64,
-        jito_tip_lamports: u64,
-        validation_mode: bool,
+        shard_idx:            usize,
+        consumer:             rtrb::Consumer<ShardWorkItem>,
+        http_producer:        rtrb::Producer<HttpWorkItem>,
+        startup_mints:        Vec<Arc<MintPoolData>>,
+        wallet:               Arc<Keypair>,
+        lut_manager:          Arc<LutManager>,
+        base_priority_fee:    u64,
+        min_profit_lamports:  u64,
+        jito_tip_lamports:    u64,
+        validation_mode:      bool,
+        sim_socket_path:      &str,
+        max_capital_lamports: u64,
     ) -> Self {
         let mut shard = Self {
             shard_idx,
             consumer,
             http_producer,
-            mint_to_graph: FxHashMap::default(),
+            mint_to_graph:    FxHashMap::default(),
             mint_to_pool_data: FxHashMap::default(),
-            account_to_mint: FxHashMap::default(),
+            account_to_mint:  FxHashMap::default(),
             wallet,
             lut_manager,
             base_priority_fee,
             min_profit_lamports,
             jito_tip_lamports,
             validation_mode,
+            // SimClient is lazy — no connection is made here. The Unix socket
+            // connect syscall is deferred to the first query() call inside
+            // fangzhen_jieduan. This means MevShard::new() is infallible even
+            // if the sim-server has not yet bound its socket.
+            sim_client: SimClient::new(sim_socket_path),
+            // CoolingStage starts empty — no pair has been fired yet.
+            cooling: CoolingStage::new(),
+            max_capital_lamports,
         };
 
         for pool_data in startup_mints {
@@ -393,7 +446,9 @@ impl MevShard {
     ///      doing any other work. This is the most important gate in the system.
     ///   2. Graph lookup — ~50 ns. FxHashMap double-hop: account → mint → graph.
     ///   3. Qualifying pair enumeration — ~50 ns per pair. Pure in-memory.
-    ///   4. Per-pair simulation (validation) or transaction build (production).
+    ///   4. Simulation stage (fangzhen_jieduan) — ternary search via sim-server.
+    ///   5. Cooling stage (sanre_jieduan) — per-pair 400 ms submission gate.
+    ///   6. Transaction build (production) or SVM simulation (validation).
     fn handle_pool_update(
         &mut self,
         pool_address: Pubkey,
@@ -457,34 +512,56 @@ impl MevShard {
             mint,
         );
 
-        // Step 4: process each qualifying pair. Sequential — no spawning, no
-        // async, no scheduling overhead. The shard thread IS the work thread.
-        //
-        // We process pairs for the same bank in sequence. If simulation takes
-        // 5 ms per pair and there are 3 qualifying pairs, total time is ~15 ms.
-        // This is acceptable: the alternative (spawning tasks) multiplied
-        // contention on the bank's internal locks. Sequential access means
-        // the bank's working set stays warm in L2 across all three simulations.
-        for (pair_idx, path) in qualifying_pairs {
-            if self.validation_mode {
-                self.try_execute_arbitrage(
-                    &path,
-                    &bank,
-                    &pool_data,
-                    blockhash,
-                    created_at,
-                    pair_idx,
-                );
-            } else {
-                self.try_submit_production(
-                    &path,
-                    &bank,
-                    &pool_data,
-                    blockhash,
-                    created_at,
-                    pair_idx,
-                );
-            }
+        // Step 4: simulation stage. Pass all qualifying pairs to fangzhen_jieduan
+        // which runs a ternary search over amount_in for each pair via the
+        // sim-server process and returns the single most profitable opportunity.
+        // Paths that never clear the profit threshold return None immediately,
+        // avoiding any SVM work or HTTP submission for unprofitable events.
+        let best = fangzhen_jieduan::evaluate_pairs(
+            &qualifying_pairs,
+            &bank,
+            &pool_data,
+            &mut self.sim_client,
+            self.max_capital_lamports,
+        );
+
+        let best = match best {
+            Some(b) => b,
+            None    => return,
+        };
+
+        // Step 5: cooling stage. A single pool update event can appear in the
+        // ring buffer many times before the first submitted transaction lands —
+        // every committed batch that touches the pool address generates a new
+        // event. The cooling stage prevents all but the first submission within
+        // one Solana slot window (400 ms) from reaching the HTTP worker.
+        // check_and_mark returns true the first time a pair fires and false for
+        // any subsequent call within the cooldown window.
+        if !self.cooling.check_and_mark(best.pair_idx) {
+            return;
+        }
+
+        // Step 6: execute or submit. validation_mode controls whether we run
+        // a full inline SVM simulation to verify profitability before logging,
+        // or build the transaction and push it to the HTTP worker immediately.
+        if self.validation_mode {
+            self.try_execute_arbitrage(
+                &best.path,
+                &bank,
+                &pool_data,
+                blockhash,
+                created_at,
+                best.pair_idx,
+            );
+        } else {
+            self.try_submit_production(
+                &best.path,
+                &bank,
+                &pool_data,
+                blockhash,
+                created_at,
+                best.pair_idx,
+            );
         }
         // `bank` Arc drops here — releasing the reference count so BankForks
         // can evict the slot as soon as all other holders (if any) also drop.

@@ -1534,6 +1534,51 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  http://127.0.0.1:8100. Required when --mev-enabled is set.",
             ),
     )
+    .arg(
+        // The sim-server is a sidecar process that performs pool-math simulation in
+        // pure Rust over a Unix domain socket.  Running it separately from the
+        // validator means the two binaries have independent lifecycles: the sim-server
+        // can be restarted or hot-patched without affecting the validator process.
+        Arg::with_name("mev_sim_socket_path")
+            .long("mev-sim-socket-path")
+            .value_name("PATH")
+            .takes_value(true)
+            .requires("mev_enabled")
+            .default_value_if("mev_enabled", None, "/tmp/sim-server.sock")
+            .help(
+                "Path to the Unix domain socket on which the sim-server sidecar process \
+                 is listening. The MEV engine connects to this socket to evaluate \
+                 arbitrage profitability in pure Rust rather than via bank.simulate_transaction, \
+                 reducing per-pair evaluation time from 1–15 ms to 5–50 µs. The sim-server \
+                 must be started independently before the validator; it is not spawned by \
+                 the validator. Defaults to /tmp/sim-server.sock when --mev-enabled is set.",
+            ),
+    )
+    .arg(
+        // Maximum capital the ternary search is allowed to probe per swap.  The
+        // search converges toward the profit-maximising amount_in within [0, cap].
+        // 400 SOL is large enough to exploit pool-depth arbitrage on the deepest
+        // Raydium/Orca pools while keeping the capital-at-risk bounded.  The
+        // on-chain profit floor still reverts any fill that lands below threshold,
+        // so over-sizing this value is cheap — it only increases search range.
+        Arg::with_name("mev_max_capital_lamports")
+            .long("mev-max-capital-lamports")
+            .value_name("LAMPORTS")
+            .takes_value(true)
+            .requires("mev_enabled")
+            .validator(|s| is_parsable::<u64>(s))
+            .default_value_if("mev_enabled", None, "400000000000")
+            .help(
+                "Maximum lamports the MEV engine may commit to a single arbitrage swap. \
+                 The ternary search probes amount_in values in [0, this_value] to locate \
+                 the profit peak. 400 SOL (400_000_000_000 lamports) is the recommended \
+                 production value — large enough for deep-pool opportunities, bounded \
+                 enough to avoid excessive slippage on shallow pools. The on-chain SMB \
+                 program still enforces the profit floor atomically at landing time, so \
+                 this ceiling affects search range rather than on-chain safety. \
+                 Defaults to 400000000000 (400 SOL) when --mev-enabled is set.",
+            ),
+    )
     .args(&pub_sub_config::args(/*test_validator:*/ false))
     .args(&json_rpc_config::args())
     .args(&rpc_bigtable_config::args())

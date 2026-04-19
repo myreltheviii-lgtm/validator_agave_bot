@@ -1,0 +1,39 @@
+[package]
+name              = "sim-client"
+# version, edition, authors, repository, and license are all inherited from
+# [workspace.package] in the root Cargo.toml. A workspace-inherited field
+# automatically tracks the workspace version without needing a manual update
+# here on every release. The sim-client crate is part of the Agave validator
+# workspace and versioned together with it.
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+repository.workspace  = true
+license.workspace     = true
+# Description is specific to this crate and intentionally not workspace-inherited.
+description           = "Zero-SDK Unix socket IPC contract shared between the Agave validator and the sim-server process"
+
+[dependencies]
+# anyhow provides the Result<T, anyhow::Error> alias and the context() method
+# used throughout the client for attaching call-site context to I/O errors.
+# Workspace-inherited so the version is always consistent with the rest of the
+# validator and only needs to be bumped in one place.
+anyhow  = { workspace = true }
+
+# bincode is the frame serialization codec. Both the validator and the
+# sim-server binary depend on this crate at exactly the same version — a
+# version mismatch would silently produce frames neither side can decode.
+# Workspace inheritance guarantees a single resolved version across both
+# binaries in the same build graph.
+bincode = { workspace = true }
+
+# serde provides the Serialize and Deserialize derives used on DexKind,
+# WireAccount, TwoHopSimRequest, TwoHopSimResponse, and TwoHopSimRequestRef.
+# The workspace entry already enables the derive feature, so it is not
+# repeated here.
+serde   = { workspace = true }
+
+# tracing instruments the SimClient's reconnect and error paths. The workspace
+# version matches what the validator uses for its own structured logging so
+# all log output from sim-client is compatible with the validator's subscriber.
+tracing = { workspace = true }

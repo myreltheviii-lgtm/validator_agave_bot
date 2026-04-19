@@ -503,6 +503,20 @@ pub struct ValidatorConfig {
     /// is immutable once deployed — an operator wishing to add accounts must deploy
     /// a new table and restart the validator.
     pub mev_lut_addresses: Vec<Pubkey>,
+    /// Unix domain socket path at which the sim-server sidecar process is
+    /// listening.  The sim-server runs as a separate OS process; the validator
+    /// connects to it over this socket rather than spawning it internally.
+    /// Keeping the sim-server out of the validator process means the two have
+    /// independent lifecycles — the sim-server can be restarted or updated
+    /// without touching the validator.
+    pub mev_sim_socket_path: String,
+    /// Maximum lamports the MEV engine is allowed to commit to a single
+    /// arbitrage swap.  The ternary search in the simulation stage probes
+    /// amounts up to this value.  Setting this to 400 SOL (400_000_000_000
+    /// lamports) balances opportunity capture — large enough to exploit
+    /// pool-depth arbitrage — against the capital risk of a landed but
+    /// unprofitable transaction before the on-chain profit floor fires.
+    pub mev_max_capital_lamports: u64,
 }
 
 impl ValidatorConfig {
@@ -620,6 +634,14 @@ impl ValidatorConfig {
             // constructing a LutManager requires a live RPC connection to fetch
             // on-chain lookup table accounts, which is unavailable in unit tests.
             mev_lut_addresses: vec![],
+            // Point at the conventional socket path so any test that
+            // accidentally enables MEV fails fast with a connection error
+            // rather than hanging or panicking inside MevEngine::new.
+            mev_sim_socket_path: "/tmp/sim-server.sock".to_string(),
+            // 400 SOL expressed in lamports.  Tests never reach this value
+            // because mev_enabled is false; the constant prevents the struct
+            // literal from being structurally incomplete.
+            mev_max_capital_lamports: 400_000_000_000u64,
         }
     }
 
@@ -1294,6 +1316,12 @@ impl Validator {
             let jito_tip_lamports = config.mev_jito_tip_lamports;
             let validation_mode = config.mev_validation_mode;
             let shredstream_url = config.mev_shredstream_url.clone();
+            // Owned copies extracted from the config borrow before entering the
+            // spawn closure.  thread::spawn requires 'static captures; referencing
+            // config directly inside the closure would attempt to move a borrowed
+            // reference across a thread boundary, which the borrow checker rejects.
+            let sim_socket_path = config.mev_sim_socket_path.clone();
+            let max_capital_lamports = config.mev_max_capital_lamports;
             // Both channel receivers are moved into the engine thread.  The Validator
             // struct retains the sender halves so that blockstore_processor and
             // ReplayStage (wired through Tvu) can write to them for the entire
@@ -1318,6 +1346,16 @@ impl Validator {
                             jito_tip_lamports,
                             validation_mode,
                             shredstream_url,
+                            // Unix socket the sim-server sidecar is bound to.
+                            // The engine connects here rather than spawning the
+                            // sim-server itself — the two processes have
+                            // independent lifecycles on the same host.
+                            sim_socket_path,
+                            // Hard ceiling on capital per swap in lamports.
+                            // 400 SOL gives the ternary search enough range to
+                            // capture deep-pool opportunities while the on-chain
+                            // profit floor still rejects any bad fill atomically.
+                            max_capital_lamports,
                             mev_startup_result.mint_pool_data,
                         );
                         engine.run();

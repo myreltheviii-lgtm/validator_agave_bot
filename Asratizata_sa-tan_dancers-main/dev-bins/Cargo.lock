@@ -5686,6 +5686,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-client"
+version = "4.1.0-alpha.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6622,6 +6632,7 @@ dependencies = [
  "serde_json",
  "shaq",
  "signal-hook",
+ "sim-client",
  "slab",
  "smallvec",
  "solana-account 4.1.0",

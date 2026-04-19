@@ -148,6 +148,18 @@ pub struct MevEngine {
     jito_tip_lamports: u64,
     shredstream_url: String,
 
+    /// Filesystem path of the Unix domain socket the sim server listens on.
+    /// Passed to each MevShard at construction so their SimClients know where
+    /// to connect. The sim server is started by engine::run() before any shard
+    /// thread is spawned, guaranteeing the socket exists when shards first query.
+    sim_socket_path: String,
+
+    /// Maximum lamports each shard will probe during the ternary search in the
+    /// simulation stage. Acts as the upper bound for the search range. Set to the
+    /// operator's available capital — the search exits early whenever a profitable
+    /// amount is found below this ceiling.
+    max_capital_lamports: u64,
+
     /// Lock-free read of the BankForks confirmed root slot.
     ///
     /// One `Ordering::Acquire` atomic load per batch — no RwLock, no syscall.
@@ -208,6 +220,8 @@ impl MevEngine {
         jito_tip_lamports: u64,
         validation_mode: bool,
         shredstream_url: String,
+        sim_socket_path: String,
+        max_capital_lamports: u64,
         mint_pool_data: Vec<Arc<MintPoolData>>,
     ) -> Self {
         let (graduation_tx, graduation_rx) =
@@ -244,15 +258,14 @@ impl MevEngine {
             jito_tip_lamports,
             validation_mode,
             shredstream_url,
+            sim_socket_path,
+            max_capital_lamports,
             root_slot,
             mint_states: FxHashMap::default(),
             account_to_mint: FxHashMap::default(),
-            // Initialised as empty Vec — bridge does not start until `run()`,
-            // so nothing reads this while the registration loop executes.
             cached_accounts_to_watch: Arc::new(ArcSwap::from(Arc::new(Vec::new()))),
             pending_ready: FxHashMap::default(),
             seen_this_batch: FxHashSet::default(),
-            // Populated in run() before the select loop starts.
             shard_producers: Vec::new(),
         };
 
@@ -405,6 +418,18 @@ impl MevEngine {
     /// OS thread is created. Once `std::thread::spawn` returns, the shard thread
     /// owns its graphs and the engine thread never touches them again.
     pub fn run(mut self) {
+        // The sim-server is a sidecar process with an independent lifecycle from
+        // the validator.  It must be started before the validator — typically via
+        // a dedicated systemd unit or a tmux pane — and left running for the
+        // validator's lifetime.  Each shard's SimClient will connect on its first
+        // query; if the socket is not yet present the SimClient surfaces a
+        // connection error in shard logs rather than silently degrading to zero
+        // simulations.
+        info!(
+            "MevEngine: expecting sim-server already running on {}",
+            self.sim_socket_path
+        );
+
         // Step 1: build ring buffers.
         //
         // 12 engine→shard buffers (capacity 512) and 12 shard→HTTP buffers
@@ -495,6 +520,8 @@ impl MevEngine {
                 self.min_profit_lamports,
                 self.jito_tip_lamports,
                 self.validation_mode,
+                &self.sim_socket_path,
+                self.max_capital_lamports,
             );
 
             std::thread::Builder::new()

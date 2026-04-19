@@ -916,6 +916,24 @@ pub fn execute(
         .unwrap_or_default()
         .to_string();
 
+    // Unix socket path for the sim-server sidecar.  The engine connects to this
+    // socket to evaluate arbitrage profitability in pure Rust rather than going
+    // through bank.simulate_transaction.  A fallback to the conventional default
+    // path is safe because the value is only used when mev_enabled is true and the
+    // engine thread actually starts; if no sim-server is listening the engine will
+    // surface a connection error rather than silently degrading.
+    let mev_sim_socket_path = matches
+        .value_of("mev_sim_socket_path")
+        .unwrap_or("/tmp/sim-server.sock")
+        .to_string();
+
+    // Maximum capital in lamports the ternary search may probe per swap.  The
+    // search scans amount_in in [0, mev_max_capital_lamports] to locate the peak
+    // of the concave profit curve.  Defaulting to 400 SOL here mirrors the clap
+    // default so the value is always consistent even if the arg is omitted.
+    let mev_max_capital_lamports =
+        value_t!(matches, "mev_max_capital_lamports", u64).unwrap_or(400_000_000_000u64);
+
     let mut validator_config = ValidatorConfig {
         logfile,
         require_tower: matches.is_present("require_tower"),
@@ -1057,6 +1075,8 @@ pub fn execute(
         mev_min_profit_lamports,
         mev_jito_tip_lamports,
         mev_shredstream_url,
+        mev_sim_socket_path,
+        mev_max_capital_lamports,
     };
 
     let vote_account = pubkey_of(matches, "vote_account").unwrap_or_else(|| {

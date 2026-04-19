@@ -230,6 +230,12 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 trees = { workspace = true }
 wincode = { workspace = true }
+# sim-client is a standalone crate that owns the Unix domain socket client,
+# all wire types, and the frame codec used to communicate with the sim-server
+# sidecar process.  It carries zero Solana SDK dependency by design so it can
+# be compiled once and shared between the validator and the sim-server binary
+# even when those two binaries are built against different SDK versions.
+sim-client = { workspace = true }
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
 jemallocator = { workspace = true }

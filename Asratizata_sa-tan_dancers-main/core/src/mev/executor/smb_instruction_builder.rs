@@ -460,7 +460,11 @@ impl SmbInstructionBuilder {
     // Reads the current tick from the bank and derives exactly 3 tick array accounts
     // at offsets [-1, 0, +1] from the current array index. Three is the fixed count the
     // on-chain executor expects — it indexes into the accounts list at compile-time offsets.
-    fn calculate_live_clmm_tick_arrays(
+    //
+    // Exposed as pub(crate) so the simulation stage (fangzhen_jieduan) can call it when
+    // building the account snapshot for CLMM and Byreal pools without duplicating the
+    // derivation logic. The function is stateless — it only reads the bank and derives PDAs.
+    pub(crate) fn calculate_live_clmm_tick_arrays(
         pool_address: &Pubkey,
         bank: &Arc<Bank>,
         program_id: &Pubkey,
@@ -636,7 +640,10 @@ impl SmbInstructionBuilder {
         Ok(())
     }
 
-    fn calculate_live_dlmm_bin_arrays(
+    // Exposed as pub(crate) so the simulation stage (fangzhen_jieduan) can call it when
+    // building the account snapshot for Meteora DLMM pools. The function is stateless —
+    // it reads one bank account and derives bin array PDAs from the active_id field.
+    pub(crate) fn calculate_live_dlmm_bin_arrays(
         pair_address: &Pubkey,
         bank: &Arc<Bank>,
     ) -> Result<Vec<Pubkey>> {
