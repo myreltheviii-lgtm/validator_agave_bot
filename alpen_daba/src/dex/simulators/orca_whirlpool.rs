@@ -71,7 +71,7 @@ impl<'a> OrcaWhirlpoolSimulator<'a> {
             required_start_indexes.len(), required_start_indexes
         );
 
-        let mut required_tick_arrays: Vec<Pubkey> = required_start_indexes
+        let required_tick_arrays: Vec<Pubkey> = required_start_indexes
             .iter()
             .map(|&idx| self.derive_tick_array_pda(pool_address, idx))
             .collect();
@@ -260,14 +260,19 @@ impl<'a> OrcaWhirlpoolSimulator<'a> {
             anyhow!("Failed to deserialize Oracle: {:?}", e)
         })?;
 
-        if self.unix_timestamp < oracle.trade_enable_timestamp {
+        // Oracle is #[repr(packed)] — taking a reference to any of its fields
+        // inside a macro that formats by reference is undefined behaviour under
+        // Rust's alignment rules. Copy the field to a local stack slot first so
+        // the formatter always receives a properly aligned reference.
+        let trade_enable_ts = oracle.trade_enable_timestamp;
+        if self.unix_timestamp < trade_enable_ts {
             warn!(
                 "  ❌ WHIRLPOOL trading not enabled yet: current={}, required={}",
-                self.unix_timestamp, oracle.trade_enable_timestamp
+                self.unix_timestamp, trade_enable_ts
             );
             return Err(anyhow!(
                 "Trading not enabled yet: current={}, required={}",
-                self.unix_timestamp, oracle.trade_enable_timestamp
+                self.unix_timestamp, trade_enable_ts
             ));
         }
 

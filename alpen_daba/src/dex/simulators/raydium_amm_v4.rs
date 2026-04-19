@@ -77,18 +77,17 @@ pub fn calculate_raydium_amm_output(
 
     // ── vaults — keys read from AmmInfo struct fields ────────────────────────
     //
-    // The old sim read these from MintPoolData (pool.coin_vault_original /
-    // pool.pc_vault_original). AmmInfo exposes the same pubkeys as
-    // coin_vault_pubkey / pc_vault_pubkey. No pool entry needed.
+    // AmmInfo exposes the vault pubkeys as `coin_vault` and `pc_vault`
+    // (see state.rs lines 681-683). No separate pool entry is needed.
 
-    let coin_vault_account = match accounts.get_account(&amm.coin_vault_pubkey) {
+    let coin_vault_account = match accounts.get_account(&amm.coin_vault) {
         Some(acc) => { info!("  ✅ RAYDIUM AMM coin vault found"); acc }
-        None      => { warn!("  ❌ RAYDIUM AMM coin vault missing: {}", amm.coin_vault_pubkey); return Ok(0); }
+        None      => { warn!("  ❌ RAYDIUM AMM coin vault missing: {}", amm.coin_vault); return Ok(0); }
     };
 
-    let pc_vault_account = match accounts.get_account(&amm.pc_vault_pubkey) {
+    let pc_vault_account = match accounts.get_account(&amm.pc_vault) {
         Some(acc) => { info!("  ✅ RAYDIUM AMM pc vault found"); acc }
-        None      => { warn!("  ❌ RAYDIUM AMM pc vault missing: {}", amm.pc_vault_pubkey); return Ok(0); }
+        None      => { warn!("  ❌ RAYDIUM AMM pc vault missing: {}", amm.pc_vault); return Ok(0); }
     };
 
     // TokenAccount::try_deserialize from token_interface validates the account
@@ -178,4 +177,3 @@ pub fn calculate_raydium_amm_output(
 
     Ok(swap_amount_out)
 }
-

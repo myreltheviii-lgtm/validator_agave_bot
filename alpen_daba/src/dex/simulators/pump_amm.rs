@@ -29,7 +29,10 @@ use anyhow::{anyhow, Result};
 use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{info, warn};
-use anchor_lang::prelude::*;
+// AccountDeserialize provides the try_deserialize method used by TokenAccount
+// below. The trait must be explicitly in scope for Rust to resolve the method
+// call even though the concrete type (TokenAccount) is what the caller writes.
+use anchor_lang::AccountDeserialize;
 
 // anchor_spl::token_interface accepts both the classic SPL Token program
 // (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA) and the Token-2022 program
@@ -51,16 +54,26 @@ use crate::account_map::AccountMap;
 // distinct from the original pump.fun bonding-curve program (6EF8rr...) which
 // handles token launches; pools only exist here after a token has graduated
 // from the bonding curve.
-const PUMP_AMM_PROGRAM_ID: Pubkey =
-    solana_pubkey::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+//
+// Pubkey::try_from parses the base58 string at call time. The function is
+// #[inline(always)] so the compiler can hoist the parse out of hot loops and
+// the result can be used anywhere a &Pubkey is needed without a const binding.
+#[inline(always)]
+fn pump_amm_program_id() -> Pubkey {
+    Pubkey::try_from("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
+        .expect("PUMP_AMM_PROGRAM_ID is a valid base58 constant")
+}
 
 // The separate fee program that owns the FeeConfig PDA.  It was introduced to
 // support market-cap-aware fee tiers layered on top of GlobalConfig's flat
 // rates, without requiring a change to the core AMM program interface.  Both
 // buy and sell instructions pass the FeeConfig account as a readonly input so
 // the AMM can cross-program-read the tier structure at swap time.
-const PUMP_FEE_PROGRAM_ID: Pubkey =
-    solana_pubkey::pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+#[inline(always)]
+fn pump_fee_program_id() -> Pubkey {
+    Pubkey::try_from("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+        .expect("PUMP_FEE_PROGRAM_ID is a valid base58 constant")
+}
 
 // ── Anchor discriminators ────────────────────────────────────────────────────
 
@@ -266,7 +279,7 @@ impl PumpAmmInfo {
         } else {
             Pubkey::find_program_address(
                 &[COIN_CREATOR_VAULT_SEED, coin_creator.as_ref()],
-                &PUMP_AMM_PROGRAM_ID,
+                &pump_amm_program_id(),
             )
             .0
         };
@@ -478,7 +491,7 @@ impl PumpFeeConfig {
 /// `find_program_address` on every estimation (each call runs an iterated
 /// SHA-256 bump search).
 fn global_config_pda() -> Pubkey {
-    Pubkey::find_program_address(&[b"global_config"], &PUMP_AMM_PROGRAM_ID).0
+    Pubkey::find_program_address(&[b"global_config"], &pump_amm_program_id()).0
 }
 
 /// Derive the canonical address of the PumpSwap FeeConfig account.
@@ -494,7 +507,7 @@ fn global_config_pda() -> Pubkey {
 fn fee_config_address() -> Pubkey {
     Pubkey::find_program_address(
         &[FEE_CONFIG_SEED, FEE_CONFIG_PROGRAM_SEED],
-        &PUMP_FEE_PROGRAM_ID,
+        &pump_fee_program_id(),
     )
     .0
 }
@@ -719,37 +732,23 @@ fn sell_base_input(
 
 // ── SPL token vault helper ────────────────────────────────────────────────────
 
-/// Read the token balance from an SPL vault account, handling both classic SPL
-/// (Token keg) and Token-2022 (Token extensions) owned accounts.
+/// Read the token balance from an SPL vault account owned by either the classic
+/// SPL Token program or the Token-2022 program.
 ///
-/// Both programs share the same base `Account` layout for the first 165 bytes,
-/// so the same `unpack` logic applies to both.  Token-2022 accounts often carry
-/// extension data beyond byte 165; the extra bytes are irrelevant here because
-/// the `amount` field lives inside the fixed 165-byte base.  A length guard is
-/// applied before slicing Token-2022 accounts to `[..165]` because their total
-/// data length can vary with the number of extensions attached.
+/// Both programs share the same base `Account` layout for the amount field, so
+/// a single deserializer handles both. anchor_spl::token_interface::TokenAccount
+/// accepts accounts owned by either program — it replaces the manual owner branch
+/// that previously imported spl_token and spl_token_2022 as standalone crates.
+/// Token-2022 accounts may carry extension data beyond the base 165 bytes; the
+/// underlying deserializer reads only the fixed base fields and ignores extensions.
 fn get_token_balance_from_account(account: &Account) -> Result<u64> {
-    if account.owner == spl_token_2022::id() {
-        use spl_token_2022::state::Account as Token2022Account;
-        if account.data.len() >= 165 {
-            let token_account = Token2022Account::unpack(&account.data[..165])?;
-            Ok(token_account.amount)
-        } else {
-            Err(anyhow!(
-                "Token-2022 vault data too short to unpack: {} bytes (need 165)",
-                account.data.len()
-            ))
-        }
-    } else if account.owner == spl_token::id() {
-        use spl_token::state::Account as TokenAccount;
-        let token_account = TokenAccount::unpack(&account.data)?;
-        Ok(token_account.amount)
-    } else {
-        Err(anyhow!(
-            "Vault account not owned by a known token program — owner: {}",
-            account.owner
-        ))
-    }
+    let mut data: &[u8] = &account.data;
+    let token_account = TokenAccount::try_deserialize(&mut data)
+        .map_err(|e| anyhow!(
+            "Failed to deserialize token vault (owner={}): {:?}",
+            account.owner, e
+        ))?;
+    Ok(token_account.amount)
 }
 
 // ── Simulator ────────────────────────────────────────────────────────────────

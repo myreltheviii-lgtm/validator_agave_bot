@@ -23,6 +23,7 @@ use crate::dex::simulators::{
     calculate_meteora_dammv2_output,
     calculate_meteora_dlmm_output,
     calculate_orca_whirlpool_output,
+    calculate_pancakeswap_output,
     calculate_pump_swap_output,
     calculate_raydium_amm_output,
     calculate_raydium_clmm_output,
@@ -67,6 +68,12 @@ pub fn dispatch(
             accounts, &pool_key, slot, timestamp, amount_in, &token_in_key,
         ),
         DexKind::ByrealClmm => calculate_byreal_clmm_output(
+            accounts, &pool_key, slot, timestamp, amount_in, &token_in_key,
+        ),
+        // PancakeSwap CLMM shares the same on-chain state layout as Raydium
+        // CLMM — the simulator delegates to the same raydium_clmm SDK crate
+        // and differs only in the program ID used for PDA derivation.
+        DexKind::PancakeSwap => calculate_pancakeswap_output(
             accounts, &pool_key, slot, timestamp, amount_in, &token_in_key,
         ),
     };

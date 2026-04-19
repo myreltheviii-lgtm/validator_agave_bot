@@ -8,6 +8,11 @@ use bytemuck;
 use arrayref::array_ref;
 use tracing::{info, warn};
 use anchor_lang::AccountDeserialize;
+// Discriminator is a trait that provides the DISCRIMINATOR associated constant
+// used to identify which account type is stored in a given on-chain account.
+// It must be explicitly imported because associated constants from traits are
+// only accessible when the trait itself is in scope.
+use anchor_lang::Discriminator;
 
 // anchor_spl::token_interface accepts both the classic SPL Token program
 // (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA) and the Token-2022 program
@@ -88,17 +93,25 @@ pub fn calculate_byreal_clmm_output(
         return Ok(0);
     }
 
-    if unix_timestamp <= pool_state_data.open_time {
+    // ByrealPoolState is #[repr(C, packed)] — taking a reference to any of its
+    // fields inside a macro that formats by reference triggers undefined behaviour
+    // under Rust's alignment rules even when the reference is never dereferenced.
+    // Copying the primitive field values into local stack variables first gives
+    // the formatter a properly aligned reference to an ordinary stack slot.
+    let open_time = pool_state_data.open_time;
+    if unix_timestamp <= open_time {
         warn!(
             "  ❌ BYREAL CLMM pool not yet open: current={}, open_time={}",
-            unix_timestamp, pool_state_data.open_time
+            unix_timestamp, open_time
         );
         return Ok(0);
     }
 
+    let liquidity    = pool_state_data.liquidity;
+    let tick_current = pool_state_data.tick_current;
     info!(
         "  ✅ BYREAL CLMM pool is open — liquidity={}, tick_current={}",
-        pool_state_data.liquidity, pool_state_data.tick_current
+        liquidity, tick_current
     );
 
     // ── amm config — key comes from pool state struct field ─────────────────
@@ -462,20 +475,33 @@ fn create_byreal_tick_array_container<'a>(
     } else if disc_bytes == DynTickArrayState::DISCRIMINATOR {
         let data_len = data_cell.borrow().len();
 
+        // The ? operator cannot be used inside RefMut::map_split because that
+        // closure must return a plain tuple, not a Result. The only fallible
+        // condition for the cast is that the trailing byte slice length is an
+        // exact multiple of size_of::<TickState>(). We validate that here,
+        // before entering the closure, so the inner cast can be infallible.
+        // Alignment is guaranteed because Vec<u8> is heap-allocated and
+        // TickState is Pod with alignment 1.
+        {
+            let data = data_cell.borrow();
+            if data.len() < DynTickArrayState::HEADER_LEN {
+                return Err(anyhow::anyhow!("Dynamic tick array too small for header"));
+            }
+            let ticks_len = data.len() - DynTickArrayState::HEADER_LEN;
+            if ticks_len % mem::size_of::<TickState>() != 0 {
+                return Err(anyhow::anyhow!(
+                    "Failed to cast to TickState slice: byte count {} not a multiple of TickState size {}",
+                    ticks_len,
+                    mem::size_of::<TickState>(),
+                ));
+            }
+        }
+
         let (header, ticks) = RefMut::map_split(data_cell.borrow_mut(), |data| {
             let (header_bytes, ticks_bytes) = data.split_at_mut(DynTickArrayState::HEADER_LEN);
             let header: &mut DynTickArrayState = bytemuck::from_bytes_mut(&mut header_bytes[8..]);
-
-            // bytemuck::try_cast_slice_mut fails when the byte slice length is not
-            // a multiple of size_of::<TickState>(), or when the slice is not
-            // properly aligned. Both conditions indicate malformed account data that
-            // the on-chain program would also reject. Propagating the error through
-            // the ? operator surfaces it at the call site where it is logged and
-            // converted to Ok(0), rather than unwinding the thread via panic.
-            // A panic here would crash the MEV execution thread inside the validator
-            // binary, which shares a process with consensus threads.
-            let ticks: &mut [TickState] = bytemuck::try_cast_slice_mut(ticks_bytes)
-                .map_err(|e| anyhow::anyhow!("Failed to cast to TickState slice: {:?}", e))?;
+            // Length divisibility was validated above; cast is infallible here.
+            let ticks: &mut [TickState] = bytemuck::cast_slice_mut(ticks_bytes);
             (header, ticks)
         });
 
