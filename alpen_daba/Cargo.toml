@@ -1,0 +1,285 @@
+[package]
+name    = "sim-server"
+version = "0.1.0"
+edition = "2021"
+
+# ── Binary definition ───────────────────────────────────────────────────────────
+#
+# The sim-server is a single long-lived companion process to the Agave validator.
+# It binds a Unix domain socket and services TwoHopSimRequest frames by running
+# DEX price math off-chain. The validator shards bundle all required account data
+# into each request, so this process never reads from the chain directly.
+[[bin]]
+name = "sim-server"
+path = "src/main.rs"
+
+# ── Dependencies ────────────────────────────────────────────────────────────────
+
+[dependencies]
+
+# ── Solana runtime types ────────────────────────────────────────────────────────
+#
+# solana-sdk provides the four types that every simulator uses as the shared
+# currency of account data: Pubkey (account addresses and program IDs), Account
+# (the owned struct returned by AccountMap::get_account), AccountInfo (the
+# borrowed reference form expected by Orca's swap manager), and Clock (the on-chain
+# time source used by Meteora DLMM for fee calculations).
+#
+# The exact-version pin (=) is intentional and load-bearing. The validator binary
+# and this companion process are compiled separately and communicate over a Unix
+# socket using bincode-serialised structs. If Cargo were given a semver range it
+# could silently resolve to a newer patch that has changed an internal struct
+# layout or a discriminant byte. The exact pin guarantees byte-identical Pubkey,
+# Account, and AccountInfo definitions on both sides of the socket.
+solana-sdk = "=2.2.1"
+
+# ── Anchor framework ────────────────────────────────────────────────────────────
+#
+# anchor-lang provides two things this codebase uses:
+#
+#   1. AccountDeserialize — the trait implemented by every Anchor program's state
+#      structs. Calling try_deserialize on config and observation accounts uses this
+#      trait to validate the 8-byte discriminator prefix before unpacking. Without
+#      discriminator validation a corrupted or wrong account at a known address would
+#      silently deserialize into garbage field values rather than returning an error.
+#
+#   2. The prelude — re-exports Pubkey and the Anchor error types that DEX SDK
+#      functions return, so the simulator call sites can use ? to propagate errors
+#      without explicit conversions.
+anchor-lang = "0.31.1"
+
+# anchor-spl provides token_interface::TokenAccount, which is the correct
+# deserializer for vault accounts on Solana because it accepts accounts owned by
+# either the classic SPL Token program (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA)
+# or the Token-2022 program (TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb).
+#
+# The classic anchor_spl::token::TokenAccount hard-codes the classic program ID as
+# the only valid owner. Pump AMM vaults are always Token-2022 owned; Meteora DAMM V2
+# and Byreal CLMM vaults can be either depending on which token standard the pool
+# creator chose at initialisation. Using token_interface in every simulator gives a
+# single deserializer that handles owner validation internally, replacing what would
+# otherwise be a conditional branch between two separate unpack calls in each file.
+#
+# The token-interface feature gates this module — without it the compiler cannot
+# resolve anchor_spl::token_interface at all.
+anchor-spl = { version = "0.31.1", features = ["token", "token_2022"] }
+
+# ── DEX SDK crates ──────────────────────────────────────────────────────────────
+#
+# Each entry below corresponds to exactly one simulator module in src/dex/simulators/.
+# No SDK is included that does not have a corresponding .rs file importing from it.
+#
+# Feature semantics used across these crates:
+#
+#   no-entrypoint  — strips the BPF program entrypoint symbol so the crate links as
+#                    a native host library rather than an on-chain binary. Without
+#                    this flag the linker sees two conflicting entrypoint definitions:
+#                    one from the DEX crate and one from this binary.
+#
+#   cpi            — exposes the cross-program invocation surface: state structs,
+#                    account layouts, and the math functions the simulator calls.
+#                    It implies no-entrypoint and does not include the full
+#                    instruction handler logic. This is the idiomatic way to consume
+#                    an Anchor program's types from an off-chain crate.
+#
+#   client         — exposes additional helper code intended for off-chain clients,
+#                    such as PDA derivation utilities. Used only where the simulator
+#                    calls SDK functions to derive tick array PDAs rather than
+#                    reimplementing the derivation locally.
+
+# Raydium classic constant-product AMM (V4).
+# default-features = false is required because the raydium_amm crate enables
+# features by default that introduce dependencies incompatible with host compilation.
+# no-entrypoint is the only feature this simulator needs.
+raydium_amm = { git = "https://github.com/veve5092-ux/raydium-amm", package = "raydium_amm", features = ["no-entrypoint"], default-features = false }
+
+# Raydium concentrated liquidity AMM (CLMM).
+# The client feature is required because raydium_clmm.rs calls SDK PDA derivation
+# helpers for tick array addresses rather than reimplementing the seed concatenation
+# locally. Those helpers are gated behind the client feature flag.
+raydium-clmm = { git = "https://github.com/myreltheii-max/raydium-clmm", branch = "development", package = "raydium-amm-v3", features = ["cpi", "client"] }
+
+# Raydium constant-product swap (CPMM).
+raydium-cp-swap = { git = "https://github.com/veve5092-ux/raydium-cp-swap", package = "raydium-cp-swap", features = ["cpi"] }
+
+# Orca Whirlpool concentrated liquidity AMM.
+orca-whirlpools = { git = "https://github.com/veve5092-ux/whirlpools", package = "whirlpool", features = ["cpi"] }
+
+# Meteora DLMM — discrete liquidity market maker.
+# The commons package from the dlmm-sdk repo exposes get_bin_array_pubkeys_for_swap
+# and quote_exact_in, which encapsulate the bin traversal math for a single-hop
+# swap. The simulator uses these directly rather than reimplementing the bin logic.
+meteora-dlmm-commons = { git = "https://github.com/veve5092-ux/dlmm-sdk", package = "commons" }
+
+# Meteora DAMM V2 — dynamic automated market maker, second generation.
+# The cp-amm package exposes Pool, PoolStatus, FeeMode, and TradeDirection — the
+# four types the DAMM V2 simulator needs to decode the pool account and compute
+# the output amount.
+meteora-cp-amm = { git = "https://github.com/veve5092-ux/damm-v2", package = "cp-amm" }
+
+# Byreal concentrated liquidity AMM.
+#
+# Byreal publishes no crates.io package. The program source is consumed as a git
+# dependency. The cpi feature exposes the state structs (PoolState, TickArrayState,
+# DynTickArrayState, AmmConfig, ObservationState, TickArrayBitmapExtension),
+# the swap_internal function from the instructions module, and the tick_math
+# library — the three import groups used in byreal_clmm.rs.
+byreal-clmm = { git = "https://github.com/byreal-git/byreal-clmm", features = ["cpi"] }
+
+# ── IPC wire types ──────────────────────────────────────────────────────────────
+#
+# sim-client is the shared contract crate that both the Agave validator shards
+# and this companion process depend on. It owns:
+#
+#   TwoHopSimRequest  — the inbound frame: slot, timestamp, two hop descriptors,
+#                       and the flat list of WireAccount snapshots.
+#   TwoHopSimResponse — the outbound frame: hop1_out and final_out amounts.
+#   WireAccount       — a pubkey + owner + raw data tuple that carries one account
+#                       snapshot from the validator's live Bank to this process.
+#   DexKind           — the discriminant enum that router::dispatch matches on to
+#                       select the correct simulator for each hop.
+#   encode_frame /
+#   decode_frame      — the length-prefixed bincode framing functions that both
+#                       sides of the Unix socket must use identically.
+#
+# Importing from one shared crate rather than duplicating these definitions
+# guarantees that both sides of the socket always operate on byte-identical struct
+# layouts and bincode discriminants. A silent layout drift between two independent
+# copies would produce corrupted deserialization that would be extremely difficult
+# to diagnose under production conditions, because the bytes would decode without
+# error into fields with plausible but wrong values.
+sim-client = { path = "../Asratizata_sa-tan_dancers-main/sim-client" }
+
+# ── Low-level byte and numeric primitives ───────────────────────────────────────
+#
+# bytemuck enables zero-copy reinterpretation of raw account data bytes into typed
+# structs via try_from_bytes and from_bytes_mut. The pool state, tick array, and
+# observation account layouts for Raydium CLMM and Byreal CLMM are plain-data
+# structs (Pod + Zeroable). The try_ variants perform an alignment and size check
+# before casting, which surfaces malformed account data as a recoverable error
+# rather than undefined behaviour.
+#
+# The derive feature enables the Pod and Zeroable derive macros used by the DEX
+# SDK crates that this binary links against. Without it those derive impls fail
+# to compile even though they are defined inside the SDK crates, because the
+# derive macros are re-exported from bytemuck itself and the feature gate is
+# checked at the crate that introduces the dependency.
+bytemuck = { version = "1.22", features = ["derive"] }
+
+# arrayref provides the array_ref! macro used in byreal_clmm.rs to extract the
+# first 8 bytes of a tick array account's data buffer as a fixed-length [u8; 8]
+# slice. The discriminator check that follows determines whether the account holds
+# a fixed-size TickArrayState or a variable-length DynTickArrayState, and therefore
+# which deserialization branch to take. A plain slice comparison would require an
+# explicit try_into().unwrap(), making the macro the cleaner option here.
+arrayref = "0.3.6"
+
+# uint from the Raydium fork of parity-common must be the single copy of this crate
+# in the entire dependency graph.
+#
+# Both raydium-clmm and byreal-clmm declare their own uint dependency pointing to
+# this same git fork. Cargo identifies crate instances by (name, source) pair —
+# a crates.io entry and a git entry for the same package name are treated as two
+# completely separate crates even if their source code is identical. If this
+# Cargo.toml were to declare uint from crates.io, Cargo would compile two uint
+# crates simultaneously. Any type defined in uint (U128, U256, etc.) that crosses
+# the boundary between this crate and either DEX SDK would then fail with a type
+# mismatch at the monomorphization boundary, because the compiler considers
+# registry-uint::U128 and git-uint::U128 to be different types regardless of
+# structural equivalence.
+#
+# Declaring the same git source here forces Cargo's dependency resolver to unify
+# all three references to a single compiled instance.
+uint = { git = "https://github.com/raydium-io/parity-common", package = "uint" }
+
+# ── Structured logging ──────────────────────────────────────────────────────────
+#
+# tracing macros (info!, warn!) instrument every simulator and every layer of the
+# server infrastructure. The sim-server is a long-lived daemon, and structured
+# per-hop log output is the primary diagnostic tool when an arbitrage path returns
+# zero — each guard in each simulator logs which specific account was missing or
+# which validation failed, making root cause analysis possible without attaching a
+# debugger to a live production process.
+tracing = "0.1"
+
+# tracing-subscriber initialises the global log dispatcher once in main(). The
+# env-filter feature enables RUST_LOG-style module-level filtering so the operator
+# can set RUST_LOG=sim_server=debug to increase verbosity for a specific module
+# without recompiling the binary or changing any code.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ── Async runtime and utilities ─────────────────────────────────────────────────
+#
+# anyhow provides the Result<T> alias and the context() / with_context() methods
+# used throughout every simulator and in server.rs. All simulator functions return
+# anyhow::Result<u64> so that error messages carry the full call-site context chain
+# needed to identify which account was absent or which math step overflowed, rather
+# than a bare error code with no provenance.
+anyhow = "1.0"
+
+# ── Compiler and linker profiles ────────────────────────────────────────────────
+
+[profile.release]
+# opt-level 3 enables every LLVM scalar optimisation pass. The swap math functions
+# in the CLMM simulators contain tight numeric loops over tick arrays that benefit
+# significantly from auto-vectorisation and constant folding.
+opt-level       = 3
+
+# Fat LTO merges all compilation units into a single LLVM module before optimising.
+# This allows the inliner to see across crate boundaries — in particular, the hot
+# path from router::dispatch into each simulator's calculate_*_output function
+# becomes a single inlining candidate rather than an opaque extern call.
+lto             = "fat"
+
+# A single codegen unit serialises all LLVM optimisation work to one thread but
+# allows global optimisations (like whole-program devirtualisation) that are
+# impossible when the IR is split across multiple units.
+codegen-units   = 1
+
+# abort on panic avoids unwinding machinery in the binary. The sim-server never
+# relies on Drop running during a panic — each handler thread is independent, and
+# a panic in one terminates that thread without affecting the listener or other
+# handler threads.
+panic           = "abort"
+
+# strip removes the symbol table and DWARF sections from the release binary.
+# The companion process is deployed alongside the validator on the same host and
+# does not need embedded debug symbols at runtime — symbols are available in the
+# build artefact if needed for offline analysis.
+strip           = true
+
+debug           = false
+overflow-checks = false
+incremental     = false
+
+[profile.release.build-override]
+# Build scripts run on the host and are not in the latency-sensitive path.
+# opt-level 0 keeps build script compilation fast; 256 codegen units maximises
+# parallelism across the many build scripts in the dependency graph.
+opt-level     = 0
+codegen-units = 256
+
+[profile.release.package."*"]
+# Disable overflow checks globally for release dependencies. The DEX SDK math
+# crates use saturating and checked arithmetic internally where overflow is a
+# domain concern; the redundant overflow check wrapper adds branch instructions
+# on every arithmetic operation without providing additional safety guarantees.
+overflow-checks = false
+
+[profile.dev]
+# Enable overflow checks in development so that any integer wrapping that would
+# be silently swallowed in release is surfaced immediately as a panic during
+# testing and local simulation runs.
+overflow-checks = true
+
+[features]
+default = []
+
+# idl-build is a build-time code generation feature used by the Anchor toolchain
+# to emit IDL JSON from the program source. It is not needed at runtime and is
+# never enabled in production builds — it exists here so that the Anchor CLI can
+# invoke it when generating client bindings for the simulator's wire types.
+idl-build = [
+    "anchor-lang/idl-build",
+    "anchor-spl/idl-build",
+]
